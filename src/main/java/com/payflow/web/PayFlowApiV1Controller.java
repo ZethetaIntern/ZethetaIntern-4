@@ -6,6 +6,8 @@ import com.payflow.entity.Refund;
 import com.payflow.entity.RoutingConfig;
 import com.payflow.entity.Transaction;
 import com.payflow.repository.*;
+import com.payflow.service.DeadLetterQueueService;
+import com.payflow.service.GatewayRateLimiter;
 import com.payflow.service.PaymentService;
 import com.payflow.service.ReconciliationService;
 import com.payflow.service.StateService;
@@ -39,13 +41,20 @@ public class PayFlowApiV1Controller {
     private final RoutingEngine routing;
     private final ReconciliationService reconciliation;
     private final StateService states;
+    private final DeadLetterQueueService deadLetterQueue;
+    private final GatewayRateLimiter rateLimiter;
+    private final com.payflow.repository.GatewayHourlyMetricRepository hourly;
+    private final com.payflow.repository.GatewayRouteSelectionRepository selections;
 
     public PayFlowApiV1Controller(PaymentService payments, TransactionRepository transactions,
                                   GatewayAttemptRepository attempts, TransactionStateLogRepository logs,
                                   RefundRepository refunds, ReconciliationLogRepository reconLogs,
                                   GatewayRouteRepository routes, RoutingConfigRepository routingConfig,
                                   RoutingEngine routing, ReconciliationService reconciliation,
-                                  StateService states) {
+                                  StateService states, DeadLetterQueueService deadLetterQueue,
+                                  GatewayRateLimiter rateLimiter,
+                                  com.payflow.repository.GatewayHourlyMetricRepository hourly,
+                                  com.payflow.repository.GatewayRouteSelectionRepository selections) {
         this.payments = payments;
         this.transactions = transactions;
         this.attempts = attempts;
@@ -57,6 +66,10 @@ public class PayFlowApiV1Controller {
         this.routing = routing;
         this.reconciliation = reconciliation;
         this.states = states;
+        this.deadLetterQueue = deadLetterQueue;
+        this.rateLimiter = rateLimiter;
+        this.hourly = hourly;
+        this.selections = selections;
     }
 
     // 1. POST /api/v1/payments
@@ -224,5 +237,53 @@ public class PayFlowApiV1Controller {
     public Map<String, Object> health() {
         return Map.of("status", "ok", "transactions", transactions.count(),
                 "gateways", routes.count());
+    }
+
+    // --- Operational endpoints for A8.3 (DLQ), A8.4 (rate limits), A3.3 (circuit) ---
+
+    /** A8.3: current dead letter queue depth (any non-zero depth is an alert). */
+    @GetMapping("/admin/webhooks/dlq")
+    public Map<String, Object> deadLetterQueue() {
+        return Map.of("depth", deadLetterQueue.depth(),
+                "items", deadLetterQueue.deadLettered());
+    }
+
+    /** A8.3: manual replay of a dead-lettered webhook. */
+    @PostMapping("/admin/webhooks/dlq/{id}/replay")
+    public Object replayDeadLetter(@PathVariable String id) {
+        return deadLetterQueue.replay(id);
+    }
+
+    /** A8.4: per-gateway rate limiter utilisation, e.g. "199/200 req/sec". */
+    @GetMapping("/admin/rate-limits")
+    public Map<String, String> rateLimits() {
+        return rateLimiter.utilisation();
+    }
+
+    /** A5.5 step 4: anomaly records raised by reconciliation (FS-11). */
+    @GetMapping("/admin/anomalies")
+    public List<?> anomalies() {
+        return reconciliation.anomalies();
+    }
+
+    /** A3.3: circuit breaker state per gateway (CLOSED / OPEN / HALF_OPEN). */
+    @GetMapping("/admin/circuits")
+    public Map<String, String> circuits() {
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        routes.findAll().forEach(g ->
+                out.put(g.getGateway(), routing.circuitState(g.getGateway()).name()));
+        return out;
+    }
+
+    /** A3.4: seeded historical hourly dataset behind the router. */
+    @GetMapping("/admin/gateways/{name}/history")
+    public List<?> gatewayHistory(@PathVariable String name) {
+        return hourly.findByGatewayOrderByRecordedAtDesc(name);
+    }
+
+    /** A6.1: which gateway was selected for a transaction, with its score. */
+    @GetMapping("/payments/{id}/routing")
+    public List<?> routingDecision(@PathVariable String id) {
+        return selections.findByTransactionId(id);
     }
 }
