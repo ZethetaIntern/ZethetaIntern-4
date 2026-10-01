@@ -20,6 +20,8 @@ public interface TransactionRepository extends JpaRepository<Transaction, String
 
     Optional<Transaction> findByIdempotencyKey(String idempotencyKey);
 
+    Optional<Transaction> findByMerchantIdAndIdempotencyKey(String merchantId, String idempotencyKey);
+
     List<Transaction> findByMerchantOrderId(String merchantOrderId);
 
     List<Transaction> findByGatewayReference(String gatewayReference);

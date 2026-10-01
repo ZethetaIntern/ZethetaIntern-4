@@ -56,15 +56,30 @@ class PaymentFlowIntegrationTest {
     @Test
     void idempotentReplayReturnsOriginal() throws Exception {
         String first = createAndProcess("idem-replay-1");
+        // Identical payload + key => idempotent replay of the completed request (200).
         mvc.perform(post("/payments")
                         .header("X-API-Key", "pk_test_payflow")
                         .header("Idempotency-Key", "idem-replay-1")
                         .contentType("application/json")
-                        .content("{\"merchantOrderId\":\"ORD-X\",\"amount\":250000,"
+                        .content("{\"merchantOrderId\":\"ORD-idem-replay-1\",\"amount\":250000,"
                                 + "\"currency\":\"INR\",\"paymentMethod\":\"card\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.replayed").value(true))
                 .andExpect(jsonPath("$.transaction_id").value(first));
+    }
+
+    /** Same key with a different payload is a genuine conflict, not a replay. */
+    @Test
+    void sameKeyDifferentPayloadIsConflict() throws Exception {
+        createAndProcess("idem-payload-1");
+        mvc.perform(post("/payments")
+                        .header("X-API-Key", "pk_test_payflow")
+                        .header("Idempotency-Key", "idem-payload-1")
+                        .contentType("application/json")
+                        .content("{\"merchantOrderId\":\"ORD-DIFFERENT\",\"amount\":999900,"
+                                + "\"currency\":\"INR\",\"paymentMethod\":\"card\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error.code").value("IDEMPOTENCY_CONFLICT"));
     }
 
     @Test

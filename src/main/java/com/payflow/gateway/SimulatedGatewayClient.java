@@ -124,6 +124,26 @@ public class SimulatedGatewayClient implements GatewayClient {
         return true;
     }
 
+    @Override
+    public void voidAuthorisation(String gateway, String reference) {
+        // Releasing the hold is a no-op in simulation; real adapters call the void API.
+    }
+
+    /**
+     * A5.5 step 2. In simulation the gateway reports the state implied by the
+     * reference, so reconciliation exercises the real mismatch path without
+     * network access.
+     */
+    @Override
+    public String fetchStatus(String gateway, String reference) {
+        if (reference == null) return "UNKNOWN";
+        if (reference.contains("expired")) return "EXPIRED";
+        if (reference.contains("failed")) return "FAILED";
+        if (reference.contains("reversed")) return "REVERSED";
+        if (reference.contains("auth")) return "AUTHORISED";
+        return "CAPTURED";
+    }
+
     private void sleepQuietly(long ms) {
         try {
             Thread.sleep(Math.min(ms, 3000));

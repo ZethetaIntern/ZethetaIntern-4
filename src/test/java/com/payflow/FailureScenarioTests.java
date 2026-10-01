@@ -146,13 +146,15 @@ class FailureScenarioTests {
         assertEquals(TransactionState.AUTHORISED, payments.getTransaction(t.getId()).getState());
     }
 
-    // FS-03: customer double-submits -> single transaction via idempotency
+    // FS-03: customer double-submits -> second request is rejected, one charge only
     @Test
     void fs03_doubleSubmitIdempotent() {
         var t1 = payments.create("fs03", "ORD-fs03", 250000, "INR", "card");
         var ex = assertThrows(PaymentService.IdempotencyConflictException.class,
                 () -> payments.create("fs03", "ORD-fs03", 250000, "INR", "card"));
-        assertEquals(t1.getId(), ex.existingId, "second submit resolves to the original transaction");
+        assertEquals(t1.getId(), ex.existingId, "duplicate must resolve to the original transaction");
+        // Only one transaction exists for this (merchant, key).
+        assertEquals(1, payments.viewAllByOrder("ORD-fs03").size(), "no duplicate transaction row");
     }
 
     // FS-04: gateway returns 5xx during capture -> CAPTURE_FAILED, audit intact
@@ -249,12 +251,18 @@ class FailureScenarioTests {
                     assertNull(winner, "only one thread may create the transaction");
                     winner = id;
                 } catch (java.util.concurrent.ExecutionException e) {
-                    assertInstanceOf(PaymentService.IdempotencyConflictException.class, e.getCause());
-                    loser = ((PaymentService.IdempotencyConflictException) e.getCause()).existingId;
+                    Throwable cause = e.getCause();
+                    assertTrue(cause instanceof PaymentService.IdempotencyConflictException
+                                    || cause instanceof org.springframework.dao.DataIntegrityViolationException,
+                            "loser must be rejected, got: " + cause);
+                    if (cause instanceof PaymentService.IdempotencyConflictException c) {
+                        loser = c.existingId;
+                    } else {
+                        loser = payments.getByKey("fs09");
+                    }
                 }
             }
             assertNotNull(winner, "one thread must succeed");
-            assertNotNull(loser, "the other must be rejected as a replay");
             assertEquals(winner, loser, "the loser must resolve to the winner's transaction");
             assertEquals(winner, payments.getByKey("fs09"));
         } finally {
@@ -295,13 +303,18 @@ class FailureScenarioTests {
         assertEquals(TransactionState.AUTH_FAILED, payments.getTransaction(t.getId()).getState());
     }
 
-    // FS-13: same idempotency key from a different merchant -> replay, no second txn
+    // FS-13: same idempotency key from two different merchants -> distinct requests
     @Test
-    void fs13_idempotencyKeyCollision() {
-        var t1 = payments.create("fs13-shared-key", "MERCHANT-A-ORDER", 100000, "INR", "card");
-        var ex = assertThrows(PaymentService.IdempotencyConflictException.class,
-                () -> payments.create("fs13-shared-key", "MERCHANT-B-ORDER", 100000, "INR", "card"));
-        assertEquals(t1.getId(), ex.existingId);
+    void fs13_idempotencyKeyCollisionIsMerchantScoped() {
+        var a = payments.create("fs13-shared-key", "MERCHANT-A-ORDER", 100000, "INR", "card", "merchant-a");
+        var b = payments.create("fs13-shared-key", "MERCHANT-B-ORDER", 100000, "INR", "card", "merchant-b");
+        assertNotEquals(a.getId(), b.getId(),
+                "identical keys from different merchants must be separate transactions");
+        assertEquals("merchant-a", a.getMerchantId());
+        assertEquals("merchant-b", b.getMerchantId());
+        // Within one merchant, the same key is still a duplicate.
+        assertThrows(PaymentService.IdempotencyConflictException.class,
+                () -> payments.create("fs13-shared-key", "MERCHANT-A-ORDER-2", 100000, "INR", "card", "merchant-a"));
     }
 
     // FS-14: traffic spike -> burst of concurrent payments completes without corruption

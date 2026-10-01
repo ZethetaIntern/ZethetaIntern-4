@@ -58,8 +58,15 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(PaymentService.IdempotencyConflictException.class)
     public ResponseEntity<Map<String, Object>> idempotency(PaymentService.IdempotencyConflictException e) {
-        return ResponseEntity.status(HttpStatus.OK).body(
-                Map.of("replayed", true, "transaction_id", e.existingId));
+        if (!e.inProgress) {
+            // Completed request replayed: 200 with the original transaction reference.
+            return ResponseEntity.ok(Map.of("replayed", true, "transaction_id", e.existingId));
+        }
+        // FS-03/FS-09: a duplicate that is still in flight gets 409 Conflict.
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(
+                error("IDEMPOTENCY_CONFLICT",
+                        "A request with this Idempotency-Key is already in progress.",
+                        Map.of("transaction_id", e.existingId)));
     }
 
     @ExceptionHandler(StateService.IllegalTransitionException.class)

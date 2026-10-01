@@ -9,17 +9,23 @@ import java.util.UUID;
 @Table(name = "transactions", indexes = {
         @Index(name = "idx_txn_order", columnList = "merchantOrderId"),
         @Index(name = "idx_txn_state", columnList = "state"),
-        @Index(name = "idx_txn_gateway_ref", columnList = "gatewayReference")})
+        @Index(name = "idx_txn_gateway_ref", columnList = "gatewayReference")},
+        uniqueConstraints = @UniqueConstraint(name = "uk_txn_merchant_idem",
+                columnNames = {"merchant_id", "idempotency_key"}))
 public class Transaction {
     @Id
     @Column(nullable = false, updatable = false)
     private String id = UUID.randomUUID().toString();
 
-    @Column(nullable = false, unique = true)
+    @Column(name = "idempotency_key", nullable = false)
     private String idempotencyKey;
 
     @Column(nullable = false)
     private String merchantOrderId;
+
+    /** Merchant scope for idempotency (FS-13): key uniqueness is (merchant_id, key). */
+    @Column(name = "merchant_id", nullable = false)
+    private String merchantId = "default";
 
     @Column(nullable = false)
     private long amountPaise;
@@ -58,6 +64,8 @@ public class Transaction {
     public void setIdempotencyKey(String k) { this.idempotencyKey = k; }
     public String getMerchantOrderId() { return merchantOrderId; }
     public void setMerchantOrderId(String o) { this.merchantOrderId = o; }
+    public String getMerchantId() { return merchantId; }
+    public void setMerchantId(String m) { this.merchantId = m; }
     public long getAmountPaise() { return amountPaise; }
     public void setAmountPaise(long a) { this.amountPaise = a; }
     public String getCurrency() { return currency; }

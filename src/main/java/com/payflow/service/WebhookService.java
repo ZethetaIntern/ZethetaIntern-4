@@ -32,15 +32,17 @@ public class WebhookService {
     private final TransactionRepository transactions;
     private final StateService states;
     private final PayFlowProperties props;
+    private final DeadLetterQueueService deadLetterQueue;
     private final ObjectMapper mapper = new ObjectMapper();
 
     public WebhookService(ProcessedWebhookEventRepository processed,
                           TransactionRepository transactions, StateService states,
-                          PayFlowProperties props) {
+                          PayFlowProperties props, DeadLetterQueueService deadLetterQueue) {
         this.processed = processed;
         this.transactions = transactions;
         this.states = states;
         this.props = props;
+        this.deadLetterQueue = deadLetterQueue;
     }
 
     /** Constant-time HMAC verification (Razorpay/Stripe: HMAC-SHA256; PayU: SHA-512). */
@@ -93,10 +95,21 @@ public class WebhookService {
         if (processed.existsByEventKey(gateway + ":" + eventId)) {
             return new Result(true, true, false, null, "duplicate_event");
         }
-        processed.save(new ProcessedWebhookEvent(gateway, eventId, eventType,
-                sha256Hex(body), txnIdInPayload));
+        try {
+            processed.save(new ProcessedWebhookEvent(gateway, eventId, eventType,
+                    sha256Hex(body), txnIdInPayload));
+        } catch (RuntimeException e) {
+            // Concurrent duplicate delivery: the unique key did its job.
+            return new Result(true, true, false, null, "duplicate_event");
+        }
 
-        return reconcile(gateway, eventId, status, gatewayRef, txnIdInPayload, amount, currency);
+        Result result = reconcile(gateway, eventId, status, gatewayRef, txnIdInPayload, amount, currency);
+        if (!result.accepted()) {
+            // Rejected after dedup (e.g. amount mismatch): park it in the DLQ.
+            deadLetterQueue.recordFailure(gateway, eventId, new String(body, StandardCharsets.UTF_8),
+                    signatureHeader == null ? "" : signatureHeader, result.reason());
+        }
+        return result;
     }
 
     private Result reconcile(String gateway, String eventId, String status,

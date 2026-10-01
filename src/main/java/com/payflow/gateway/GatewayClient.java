@@ -9,6 +9,12 @@ public interface GatewayClient {
     /** Release an uncaptured authorisation hold (A7.1 #5). */
     default void voidAuthorisation(String gateway, String reference) { }
 
+    /**
+     * A5.5 step 2: fetch the gateway's authoritative status for a reference.
+     * Returns one of AUTHORISED, CAPTURED, FAILED, EXPIRED, REFUNDED or UNKNOWN.
+     */
+    default String fetchStatus(String gateway, String reference) { return "UNKNOWN"; }
+
     record AuthResult(boolean ok, String reference, String errorCode, long latencyMs) {}
 
     record CaptureResult(boolean ok, long capturedPaise, String errorCode, long latencyMs) {}

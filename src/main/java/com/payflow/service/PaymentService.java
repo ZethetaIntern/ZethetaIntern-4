@@ -25,9 +25,15 @@ public class PaymentService {
 
     public static class IdempotencyConflictException extends RuntimeException {
         public final String existingId;
+        /** True when the key is still in flight (409); false when already completed (200 replay). */
+        public final boolean inProgress;
         public IdempotencyConflictException(String existingId) {
+            this(existingId, true);
+        }
+        public IdempotencyConflictException(String existingId, boolean inProgress) {
             super("idempotency key already used");
             this.existingId = existingId;
+            this.inProgress = inProgress;
         }
     }
 
@@ -39,7 +45,9 @@ public class PaymentService {
     private final RoutingEngine routing;
     private final StateService states;
     private final GatewayClient gateways;
-    private final TransactionLookup lookup;
+    private final IdempotencyService idempotency;
+    private final GatewayRateLimiter rateLimiter;
+    private final com.payflow.repository.GatewayRouteSelectionRepository selections;
     private final com.payflow.gateway.MockControlContext mockControl;
 
     /** Mock control for the current request; null-safe outside an HTTP request. */
@@ -57,7 +65,9 @@ public class PaymentService {
     public PaymentService(TransactionRepository transactions, TransactionStateLogRepository stateLogs,
                           GatewayAttemptRepository attempts, IdempotencyKeyRepository idempotencyKeys,
                           RefundRepository refunds, RoutingEngine routing, StateService states,
-                          GatewayClient gateways, TransactionLookup lookup,
+                          GatewayClient gateways, IdempotencyService idempotency,
+                          GatewayRateLimiter rateLimiter,
+                          com.payflow.repository.GatewayRouteSelectionRepository selections,
                           MockControlContext mockControl, PayFlowProperties props) {
         this.transactions = transactions;
         this.stateLogs = stateLogs;
@@ -67,35 +77,73 @@ public class PaymentService {
         this.routing = routing;
         this.states = states;
         this.gateways = gateways;
-        this.lookup = lookup;
+        this.idempotency = idempotency;
+        this.rateLimiter = rateLimiter;
+        this.selections = selections;
         this.mockControl = mockControl;
         this.props = props;
     }
 
-    /** Idempotent creation: replays return the original transaction. */
+    /**
+     * Idempotent creation (spec A8.2, FS-03, FS-09, FS-13).
+     *
+     * <p>Scope: {@code (merchantId, key)}. A completed key replays the original
+     * transaction; a key that is still in flight yields
+     * {@link IdempotencyConflictException} (HTTP 409).</p>
+     */
     @Transactional
     public Transaction create(String idempotencyKey, String merchantOrderId, long amountPaise,
                               String currency, String paymentMethod) {
-        var existing = transactions.findByIdempotencyKey(idempotencyKey);
-        if (existing.isPresent()) {
-            throw new IdempotencyConflictException(existing.get().getId());
+        return create(idempotencyKey, merchantOrderId, amountPaise, currency, paymentMethod, "default");
+    }
+
+    @Transactional
+    public Transaction create(String idempotencyKey, String merchantOrderId, long amountPaise,
+                              String currency, String paymentMethod, String merchantId) {
+        String requestHash = IdempotencyService.requestHash(merchantOrderId, amountPaise, currency, paymentMethod);
+
+        // A8.2: serialise concurrent requests for the same key at the database level.
+        idempotency.acquireAdvisoryLock(merchantId, idempotencyKey);
+
+        // Fast path: a known key never reaches the database insert.
+        IdempotencyService.Decision known = idempotency.peek(merchantId, idempotencyKey, requestHash);
+        if (known.outcome() == IdempotencyService.Outcome.REPLAY) {
+            throw new IdempotencyConflictException(known.transactionId(), false);
         }
+        if (known.outcome() == IdempotencyService.Outcome.CONFLICT_IN_PROGRESS) {
+            throw new IdempotencyConflictException(known.transactionId(), true);
+        }
+
         Transaction t = new Transaction();
         t.setIdempotencyKey(idempotencyKey);
+        t.setMerchantId(merchantId);
         t.setMerchantOrderId(merchantOrderId);
         t.setAmountPaise(amountPaise);
         t.setCurrency(currency);
         t.setPaymentMethod(paymentMethod);
         try {
-            // Flush eagerly so a concurrent insert of the same key surfaces here,
-            // letting us translate the unique-constraint violation into a replay.
             t = transactions.saveAndFlush(t);
         } catch (org.springframework.dao.DataIntegrityViolationException e) {
-            // The lookup must run in a fresh transaction: this one is rollback-only.
-            String winner = lookup.findIdByIdempotencyKey(idempotencyKey);
-            throw new IdempotencyConflictException(winner == null ? "unknown" : winner);
+            // Lost the insert race (FS-09): another request holds (merchantId, key).
+            String winner = idempotency.findExistingId(merchantId, idempotencyKey);
+            throw new IdempotencyConflictException(winner == null ? "unknown" : winner, true);
         }
-        idempotencyKeys.save(new IdempotencyKey(idempotencyKey, t.getId()));
+
+        IdempotencyService.Decision decision =
+                idempotency.reserve(merchantId, idempotencyKey, t.getId(), requestHash);
+        switch (decision.outcome()) {
+            case REPLAY -> {
+                // Already completed: return the original transaction as an idempotent replay.
+                transactions.delete(t);
+                throw new IdempotencyConflictException(decision.transactionId(), false);
+            }
+            case CONFLICT_IN_PROGRESS -> {
+                // Still in flight (FS-03/FS-09) or a different payload on the same key.
+                transactions.delete(t);
+                throw new IdempotencyConflictException(decision.transactionId(), true);
+            }
+            default -> { /* reserved: this request owns the key */ }
+        }
         stateLogs.save(new TransactionStateLog(t.getId(), null, TransactionState.CREATED,
                 "api", "amount=" + amountPaise + " " + currency + " method=" + paymentMethod));
         return t;
@@ -113,12 +161,20 @@ public class PaymentService {
 
         states.applyTransition(txnId, TransactionState.ROUTING, "orchestrator",
                 "ranked=" + ranked.stream().map(r -> r.route().getGateway()).toList());
+        // A6.1: persist which gateway was selected, with its score and rank.
+        for (int i = 0; i < ranked.size(); i++) {
+            var p = ranked.get(i);
+            selections.save(new com.payflow.entity.GatewayRouteSelection(
+                    txnId, p.route().getGateway(), p.score(), i + 1, 0));
+        }
 
         String lastError = null;
         int attemptNo = 0;
         for (var plan : ranked) {
             String gw = plan.route().getGateway();
             attemptNo++;
+            // A8.4: respect the gateway's outbound rate limit (delay, never drop).
+            rateLimiter.acquire(gw);
             states.applyTransition(txnId, TransactionState.AUTH_INITIATED, "orchestrator",
                     "gateway=" + gw + " attempt=" + attemptNo);
             try {
@@ -154,7 +210,10 @@ public class PaymentService {
                 states.applyTransition(txnId, TransactionState.AUTHORISED, "gateway:" + gw,
                         "reference=" + auth.reference() + " latencyMs=" + latency);
 
-                return captureFlow(txnId, gw, auth.reference(), attemptNo);
+                Transaction finalTxn = captureFlow(txnId, gw, auth.reference(), attemptNo);
+                idempotency.complete(t.getMerchantId(), t.getIdempotencyKey(),
+                        com.payflow.entity.IdempotencyKey.Status.COMPLETED);
+                return finalTxn;
             } catch (GatewayClient.GatewayException e) {
                 boolean timeout = e instanceof GatewayClient.GatewayTimeout;
                 routing.recordResult(gw, false, props.attemptTimeoutMillis());
@@ -188,6 +247,8 @@ public class PaymentService {
             }
         }
         states.forceFailTerminal(txnId, lastError == null ? "all gateways exhausted" : lastError);
+        idempotency.complete(t.getMerchantId(), t.getIdempotencyKey(),
+                com.payflow.entity.IdempotencyKey.Status.FAILED);
         return transactions.findById(txnId).orElseThrow();
     }
 

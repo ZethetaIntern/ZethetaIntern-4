@@ -21,10 +21,15 @@ public class RoutingEngine {
 
     public record RankedGateway(GatewayRoute route, double score) {}
 
+    /** A3.3 circuit breaker states. */
+    public enum CircuitState { CLOSED, OPEN, HALF_OPEN }
+
     public static final int MIN_SAMPLES = 10;
     public static final double PRIOR_SUCCESS_RATE = 0.85;
     static final int FAILURE_THRESHOLD = 5;
     static final long CIRCUIT_OPEN_SECONDS = 30;
+    /** Probes allowed through while HALF_OPEN before the state is decided. */
+    static final int HALF_OPEN_PROBES = 1;
 
     private final GatewayRouteRepository routes;
     private final RoutingConfigRepository configRepo;
@@ -49,8 +54,9 @@ public class RoutingEngine {
 
     private boolean isEligible(GatewayRoute r, String paymentMethod) {
         Instant now = Instant.now();
-        return r.isHealthy() && now.isAfter(r.getCircuitOpenUntil())
-                && !("upi".equals(paymentMethod) && !r.isSupportsUpi());
+        boolean circuitAllows = r.isHealthy() || now.isAfter(r.getCircuitOpenUntil());
+        // Gateways that do not support UPI rails cannot take UPI payments.
+        return circuitAllows && !("upi".equals(paymentMethod) && !r.isSupportsUpi());
     }
 
     private double score(GatewayRoute r, String paymentMethod, long amountPaise, RoutingConfig cfg) {
@@ -74,6 +80,25 @@ public class RoutingEngine {
                 + cfg.getWeightCost() * (1 - costNorm)
                 + cfg.getWeightHealth() * (r.isHealthy() ? 1.0 : 0.0)
                 + cfg.getWeightMethodFit() * methodFit;
+    }
+
+    /** Current circuit state for a gateway (A3.3). */
+    public CircuitState circuitState(String gateway) {
+        return routes.findById(gateway).map(r -> {
+            Instant now = Instant.now();
+            if (!r.isHealthy() && now.isBefore(r.getCircuitOpenUntil())) return CircuitState.OPEN;
+            if (!r.isHealthy()) return CircuitState.HALF_OPEN; // cool-down elapsed, probe allowed
+            return CircuitState.CLOSED;
+        }).orElse(CircuitState.OPEN);
+    }
+
+    /**
+     * A3.3: a HALF_OPEN gateway still receives a small, bounded share of traffic
+     * as probes. It is otherwise excluded, so a recovering gateway can prove
+     * itself without a traffic surge.
+     */
+    public boolean allowProbe(String gateway) {
+        return circuitState(gateway) != CircuitState.OPEN;
     }
 
     /** Update rolling stats after an attempt; circuit-break after repeated failures. */
@@ -101,8 +126,14 @@ public class RoutingEngine {
     public void setHealth(String gateway, boolean healthy) {
         routes.findById(gateway).ifPresent(r -> {
             r.setHealthy(healthy);
-            r.setCircuitOpenUntil(Instant.EPOCH);
-            if (healthy) r.setConsecutiveFailures(0);
+            if (healthy) {
+                r.setCircuitOpenUntil(Instant.EPOCH);
+                r.setConsecutiveFailures(0);
+            } else {
+                // A3.3: mark OPEN for the cool-down window; it becomes HALF_OPEN
+                // (probe-eligible) once the window elapses.
+                r.setCircuitOpenUntil(Instant.now().plusSeconds(CIRCUIT_OPEN_SECONDS));
+            }
             routes.save(r);
         });
     }
