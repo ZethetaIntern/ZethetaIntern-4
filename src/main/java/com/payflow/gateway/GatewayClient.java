@@ -6,6 +6,9 @@ public interface GatewayClient {
     CaptureResult capture(String gateway, String reference, long amountPaise) throws GatewayException;
     boolean refund(String gateway, String reference, long amountPaise);
 
+    /** Release an uncaptured authorisation hold (A7.1 #5). */
+    default void voidAuthorisation(String gateway, String reference) { }
+
     record AuthResult(boolean ok, String reference, String errorCode, long latencyMs) {}
 
     record CaptureResult(boolean ok, long capturedPaise, String errorCode, long latencyMs) {}

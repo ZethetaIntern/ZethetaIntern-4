@@ -17,9 +17,11 @@ import java.security.MessageDigest;
 public class ApiKeyFilter extends OncePerRequestFilter {
 
     private final PayFlowProperties props;
+    private final com.payflow.gateway.MockControlContext mockControl;
 
-    public ApiKeyFilter(PayFlowProperties props) {
+    public ApiKeyFilter(PayFlowProperties props, com.payflow.gateway.MockControlContext mockControl) {
         this.props = props;
+        this.mockControl = mockControl;
     }
 
     @Override
@@ -27,12 +29,15 @@ public class ApiKeyFilter extends OncePerRequestFilter {
                                     FilterChain chain) throws ServletException, IOException {
         String path = request.getRequestURI();
         // Webhooks authenticate via HMAC; health and API-docs are public.
-        if (path.startsWith("/webhooks") || path.equals("/health")
+        if (path.startsWith("/webhooks") || path.startsWith("/api/v1/webhooks") || path.equals("/health")
+                || path.equals("/api/v1/health")
                 || path.startsWith("/v3/api-docs") || path.startsWith("/v3/api-docs/")
                 || path.startsWith("/swagger-ui") || path.startsWith("/h2-console")) {
             chain.doFilter(request, response);
             return;
         }
+        // Mock gateway control headers (spec B4.3) are read by the gateway adapter.
+        mockControl.set(com.payflow.gateway.MockControl.fromHeaders(headersOf(request)));
         String key = request.getHeader("X-API-Key");
         if (key == null || !MessageDigest.isEqual(
                 key.getBytes(StandardCharsets.UTF_8),
@@ -44,5 +49,15 @@ public class ApiKeyFilter extends OncePerRequestFilter {
             return;
         }
         chain.doFilter(request, response);
+    }
+
+    private java.util.Map<String, String> headersOf(HttpServletRequest request) {
+        java.util.Map<String, String> map = new java.util.HashMap<>();
+        java.util.Enumeration<String> names = request.getHeaderNames();
+        while (names.hasMoreElements()) {
+            String name = names.nextElement();
+            map.put(name, request.getHeader(name));
+        }
+        return map;
     }
 }

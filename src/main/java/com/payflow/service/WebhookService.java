@@ -86,6 +86,8 @@ public class WebhookService {
         String status = payload.path("status").asText("").toLowerCase();
         String gatewayRef = payload.path("gateway_reference").asText(null);
         String txnIdInPayload = payload.path("transaction_id").asText(null);
+        Long amount = payload.hasNonNull("amount") ? payload.get("amount").asLong() : null;
+        String currency = payload.path("currency").asText(null);
 
         // Insert is the dedup gate; PK (gateway:event_id) violation => duplicate.
         if (processed.existsByEventKey(gateway + ":" + eventId)) {
@@ -94,11 +96,11 @@ public class WebhookService {
         processed.save(new ProcessedWebhookEvent(gateway, eventId, eventType,
                 sha256Hex(body), txnIdInPayload));
 
-        return reconcile(gateway, eventId, status, gatewayRef, txnIdInPayload);
+        return reconcile(gateway, eventId, status, gatewayRef, txnIdInPayload, amount, currency);
     }
 
     private Result reconcile(String gateway, String eventId, String status,
-                             String gatewayRef, String txnIdInPayload) {
+                             String gatewayRef, String txnIdInPayload, Long amount, String currency) {
         Transaction t = null;
         if (gatewayRef != null) {
             t = transactions.findByGatewayReference(gatewayRef).stream().findFirst().orElse(null);
@@ -110,6 +112,25 @@ public class WebhookService {
             return new Result(true, false, false, null, "unmatched_event");
         }
         String txnId = t.getId();
+
+        // --- Critical verification steps from case study C4 (webhook replay fraud) ---
+        // Amount match: a tampered amount must never mark an order as paid.
+        if (amount != null && amount != 0 && amount != t.getAmountPaise()
+                && status.equals("succeeded") && t.getAmountPaise() != t.getCapturedPaise()) {
+            return new Result(false, false, false, txnId,
+                    "AMOUNT_MISMATCH: webhook amount " + amount + " != expected " + t.getAmountPaise());
+        }
+        // Currency match.
+        if (currency != null && !currency.isBlank() && !currency.equalsIgnoreCase(t.getCurrency())) {
+            return new Result(false, false, false, txnId,
+                    "CURRENCY_MISMATCH: webhook currency " + currency + " != " + t.getCurrency());
+        }
+        // Transaction/reference match: the gateway reference must be the one we stored.
+        if (gatewayRef != null && t.getGatewayReference() != null
+                && !gatewayRef.equals(t.getGatewayReference())) {
+            return new Result(false, false, false, txnId, "GATEWAY_REFERENCE_MISMATCH");
+        }
+
         TransactionState current = t.getState();
         boolean reconciled = false;
         switch (status) {

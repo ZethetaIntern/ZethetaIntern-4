@@ -12,6 +12,7 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
+import java.util.List;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -135,10 +136,124 @@ class AdminApiTest {
                 .andExpect(jsonPath("$.paths['/webhooks/{gateway}'].post").exists());
     }
 
+    // --- Spec A7.1 /api/v1 surface -------------------------------------------------
+
+    @Test
+    void apiV1PaymentLifecycle() throws Exception {
+        String id = json(mvc.perform(post("/api/v1/payments")
+                        .header("X-API-Key", KEY).header("Idempotency-Key", "apiv1-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"merchantOrderId\":\"ORD-V1\",\"amount\":250000,"
+                                + "\"currency\":\"INR\",\"paymentMethod\":\"card\"}"))
+                .andExpect(status().isCreated()).andReturn(), "$.payment.id");
+
+        mvc.perform(get("/api/v1/payments/{id}", id).header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/payments").param("merchant_order_id", "ORD-V1").header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/payments/{id}/timeline", id).header("X-API-Key", KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$", org.hamcrest.Matchers.hasSize(
+                        org.hamcrest.Matchers.greaterThan(2))));
+        mvc.perform(get("/api/v1/payments/{id}/refunds", id).header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void apiV1GatewayAndRoutingEndpoints() throws Exception {
+        mvc.perform(get("/api/v1/gateways").header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/gateways/razorpay/health").header("X-API-Key", KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.gateway").value("razorpay"));
+        mvc.perform(get("/api/v1/gateways/razorpay/metrics").header("X-API-Key", KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.successRate").exists());
+        mvc.perform(get("/api/v1/routing/config").header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/analytics/success-rate").header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/analytics/volume").header("X-API-Key", KEY))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/v1/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ok"));
+    }
+
+    @Test
+    void apiV1ReconciliationTriggerAndReport() throws Exception {
+        String runId = json(mvc.perform(post("/api/v1/reconciliation/trigger").header("X-API-Key", KEY))
+                .andExpect(status().isOk()).andReturn(), "$.run_id");
+        mvc.perform(get("/api/v1/reconciliation/reports/{runId}", runId).header("X-API-Key", KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.run_id").value(runId));
+    }
+
+    @Test
+    void apiV1PerGatewayWebhookReceivers() throws Exception {
+        String body = "{\"event_id\":\"apiv1-evt\",\"status\":\"succeeded\"}";
+        for (String gw : List.of("razorpay", "stripe", "upi")) {
+            mvc.perform(post("/api/v1/webhooks/{gw}", gw)
+                            .contentType(MediaType.APPLICATION_JSON).content(body)
+                            .header("X-Payflow-Signature", hmac(body, "HmacSHA256")))
+                    .andExpect(status().isOk());
+        }
+        // PayU signs with HMAC-SHA512 (A5.3); a SHA-256 signature must be rejected.
+        mvc.perform(post("/api/v1/webhooks/payu")
+                        .contentType(MediaType.APPLICATION_JSON).content(body)
+                        .header("X-Payflow-Signature", hmac(body, "HmacSHA256")))
+                .andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/v1/webhooks/payu")
+                        .contentType(MediaType.APPLICATION_JSON).content(body)
+                        .header("X-Payflow-Signature", hmac(body, "HmacSHA512")))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void errorResponsesIncludeRequestId() throws Exception {
+        mvc.perform(get("/payments/nope").header("X-API-Key", KEY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.request_id").exists())
+                .andExpect(jsonPath("$.error.details").exists());
+    }
+
+    // --- Spec B4.3 mock control headers -------------------------------------------
+
+    @Test
+    void mockHeaderServerErrorTriggersFailover() throws Exception {
+        mvc.perform(post("/payments")
+                        .header("X-API-Key", KEY).header("Idempotency-Key", "mock-502")
+                        .header("X-Mock-Response", "server-error")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"merchantOrderId\":\"ORD-M1\",\"amount\":100000,"
+                                + "\"currency\":\"INR\",\"paymentMethod\":\"card\"}"))
+                .andExpect(status().isCreated());
+    }
+
+    @Test
+    void mockHeaderSuccessForcesHappyPath() throws Exception {
+        mvc.perform(post("/payments")
+                        .header("X-API-Key", KEY).header("Idempotency-Key", "mock-ok")
+                        .header("X-Mock-Response", "success")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"merchantOrderId\":\"ORD-M2\",\"amount\":100000,"
+                                + "\"currency\":\"INR\",\"paymentMethod\":\"card\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.transaction.state").value("CAPTURED"));
+    }
+
+    private String json(org.springframework.test.web.servlet.MvcResult result, String path) throws Exception {
+        return com.jayway.jsonpath.JsonPath.read(result.getResponse().getContentAsString(), path);
+    }
+
     private String hmac(String body) {
+        return hmac(body, "HmacSHA256");
+    }
+
+    private String hmac(String body, String algorithm) {
         try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec("whsec_test_secret".getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            Mac mac = Mac.getInstance(algorithm);
+            mac.init(new SecretKeySpec("whsec_test_secret".getBytes(StandardCharsets.UTF_8), algorithm));
             return HexFormat.of().formatHex(mac.doFinal(body.getBytes(StandardCharsets.UTF_8)));
         } catch (Exception e) {
             throw new IllegalStateException(e);

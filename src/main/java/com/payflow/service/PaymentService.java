@@ -6,6 +6,7 @@ import com.payflow.domain.AttemptOutcome;
 import com.payflow.domain.TransactionState;
 import com.payflow.entity.*;
 import com.payflow.gateway.GatewayClient;
+import com.payflow.gateway.MockControlContext;
 import com.payflow.repository.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,13 +40,25 @@ public class PaymentService {
     private final StateService states;
     private final GatewayClient gateways;
     private final TransactionLookup lookup;
+    private final com.payflow.gateway.MockControlContext mockControl;
+
+    /** Mock control for the current request; null-safe outside an HTTP request. */
+    private com.payflow.gateway.MockControl currentMockControl() {
+        try {
+            return mockControl.get();
+        } catch (org.springframework.beans.factory.support.ScopeNotActiveException e) {
+            // No active request (e.g. scheduled jobs, direct service calls in tests).
+            return com.payflow.gateway.MockControl.fromHeaders(java.util.Map.of());
+        }
+    }
     private final PayFlowProperties props;
     private final ExecutorService gatewayPool = Executors.newCachedThreadPool();
 
     public PaymentService(TransactionRepository transactions, TransactionStateLogRepository stateLogs,
                           GatewayAttemptRepository attempts, IdempotencyKeyRepository idempotencyKeys,
                           RefundRepository refunds, RoutingEngine routing, StateService states,
-                          GatewayClient gateways, TransactionLookup lookup, PayFlowProperties props) {
+                          GatewayClient gateways, TransactionLookup lookup,
+                          MockControlContext mockControl, PayFlowProperties props) {
         this.transactions = transactions;
         this.stateLogs = stateLogs;
         this.attempts = attempts;
@@ -55,6 +68,7 @@ public class PaymentService {
         this.states = states;
         this.gateways = gateways;
         this.lookup = lookup;
+        this.mockControl = mockControl;
         this.props = props;
     }
 
@@ -109,8 +123,15 @@ public class PaymentService {
                     "gateway=" + gw + " attempt=" + attemptNo);
             try {
                 long started = System.currentTimeMillis();
-                Future<GatewayClient.AuthResult> future = gatewayPool.submit(
-                        () -> gateways.authorize(gw, t.getAmountPaise(), txnId));
+                final com.payflow.gateway.MockControl control = currentMockControl();
+                Future<GatewayClient.AuthResult> future = gatewayPool.submit(() -> {
+                    com.payflow.gateway.MockControl.bind(control);
+                    try {
+                        return gateways.authorize(gw, t.getAmountPaise(), txnId);
+                    } finally {
+                        com.payflow.gateway.MockControl.clear();
+                    }
+                });
                 GatewayClient.AuthResult auth;
                 try {
                     auth = future.get(props.attemptTimeoutMillis(), TimeUnit.MILLISECONDS);
@@ -180,8 +201,15 @@ public class PaymentService {
         try {
             long started = System.currentTimeMillis();
             long amount = transactions.findById(txnId).orElseThrow().getAmountPaise();
-            Future<GatewayClient.CaptureResult> f = gatewayPool.submit(
-                    () -> gateways.capture(gw, reference, amount));
+            final com.payflow.gateway.MockControl control = currentMockControl();
+            Future<GatewayClient.CaptureResult> f = gatewayPool.submit(() -> {
+                com.payflow.gateway.MockControl.bind(control);
+                try {
+                    return gateways.capture(gw, reference, amount);
+                } finally {
+                    com.payflow.gateway.MockControl.clear();
+                }
+            });
             GatewayClient.CaptureResult cap = f.get(props.attemptTimeoutMillis(), TimeUnit.MILLISECONDS);
             long latency = System.currentTimeMillis() - started;
             final long captured = cap.capturedPaise();
@@ -202,6 +230,19 @@ public class PaymentService {
                     "capture error: " + e.getMessage());
         }
         return transactions.findById(txnId).orElseThrow();
+    }
+
+    /** Void an uncaptured authorisation, releasing the gateway hold (A7.1 #5). */
+    @Transactional
+    public Transaction voidAuthorisation(String txnId) {
+        Transaction t = states.applyTransition(txnId, TransactionState.VOID_INITIATED, "api",
+                "void authorisation hold=" + t(txnId));
+        gateways.voidAuthorisation(t.getGateway(), t.getGatewayReference());
+        return states.applyTransition(txnId, TransactionState.VOIDED, "api", "authorisation released");
+    }
+
+    private String t(String txnId) {
+        return transactions.findById(txnId).map(Transaction::getAmountPaise).map(String::valueOf).orElse("0");
     }
 
     @Transactional
