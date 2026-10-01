@@ -3,3 +3,6 @@ target/
 .idea/
 *.iml
 .mvn/
+build.log
+mvn_out.txt
+mvn_err.txt
