@@ -17,7 +17,7 @@ public class Refund {
     @Column(nullable = false, updatable = false)
     private long amountPaise;
 
-    @Column(nullable = false, updatable = false)
+    @Column(name = "gateway", nullable = true, updatable = false)
     private String gateway;
 
     @Column(nullable = false, updatable = false)

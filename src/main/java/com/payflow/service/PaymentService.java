@@ -38,13 +38,14 @@ public class PaymentService {
     private final RoutingEngine routing;
     private final StateService states;
     private final GatewayClient gateways;
+    private final TransactionLookup lookup;
     private final PayFlowProperties props;
     private final ExecutorService gatewayPool = Executors.newCachedThreadPool();
 
     public PaymentService(TransactionRepository transactions, TransactionStateLogRepository stateLogs,
                           GatewayAttemptRepository attempts, IdempotencyKeyRepository idempotencyKeys,
                           RefundRepository refunds, RoutingEngine routing, StateService states,
-                          GatewayClient gateways, PayFlowProperties props) {
+                          GatewayClient gateways, TransactionLookup lookup, PayFlowProperties props) {
         this.transactions = transactions;
         this.stateLogs = stateLogs;
         this.attempts = attempts;
@@ -53,6 +54,7 @@ public class PaymentService {
         this.routing = routing;
         this.states = states;
         this.gateways = gateways;
+        this.lookup = lookup;
         this.props = props;
     }
 
@@ -70,7 +72,15 @@ public class PaymentService {
         t.setAmountPaise(amountPaise);
         t.setCurrency(currency);
         t.setPaymentMethod(paymentMethod);
-        t = transactions.save(t);
+        try {
+            // Flush eagerly so a concurrent insert of the same key surfaces here,
+            // letting us translate the unique-constraint violation into a replay.
+            t = transactions.saveAndFlush(t);
+        } catch (org.springframework.dao.DataIntegrityViolationException e) {
+            // The lookup must run in a fresh transaction: this one is rollback-only.
+            String winner = lookup.findIdByIdempotencyKey(idempotencyKey);
+            throw new IdempotencyConflictException(winner == null ? "unknown" : winner);
+        }
         idempotencyKeys.save(new IdempotencyKey(idempotencyKey, t.getId()));
         stateLogs.save(new TransactionStateLog(t.getId(), null, TransactionState.CREATED,
                 "api", "amount=" + amountPaise + " " + currency + " method=" + paymentMethod));
@@ -132,9 +142,27 @@ public class PaymentService {
                         props.attemptTimeoutMillis(), e.code);
                 lastError = e.code + " on " + gw + ": " + e.getMessage();
                 onAttemptFailure(txnId, gw, lastError, attemptNo);
-            } catch (ExecutionException | InterruptedException e) {
+            } catch (ExecutionException ee) {
+                // A gateway failure thrown inside the worker thread arrives wrapped.
+                Throwable cause = ee.getCause();
+                if (cause instanceof GatewayClient.GatewayException ge) {
+                    boolean timeout = ge instanceof GatewayClient.GatewayTimeout;
+                    routing.recordResult(gw, false, props.attemptTimeoutMillis());
+                    recordAttempt(txnId, gw, attemptNo,
+                            timeout ? AttemptOutcome.TIMEOUT : AttemptOutcome.DECLINED,
+                            props.attemptTimeoutMillis(), ge.code);
+                    lastError = ge.code + " on " + gw + ": " + ge.getMessage();
+                    onAttemptFailure(txnId, gw, lastError, attemptNo);
+                } else {
+                    routing.recordResult(gw, false, props.attemptTimeoutMillis());
+                    recordAttempt(txnId, gw, attemptNo, AttemptOutcome.DECLINED,
+                            props.attemptTimeoutMillis(), "INTERNAL_ERROR");
+                    lastError = "internal error on " + gw + ": " + cause;
+                    onAttemptFailure(txnId, gw, lastError, attemptNo);
+                }
+            } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
-                lastError = "internal error on " + gw;
+                lastError = "interrupted while calling " + gw;
                 onAttemptFailure(txnId, gw, lastError, attemptNo);
             }
         }
@@ -144,7 +172,11 @@ public class PaymentService {
 
     /** Capture phase of the two-phase flow; returns the final transaction. */
     public Transaction captureFlow(String txnId, String gw, String reference, int attemptNo) {
-        states.applyTransition(txnId, TransactionState.CAPTURE_INITIATED, "orchestrator", "gateway=" + gw);
+        // The caller may already have advanced the state (e.g. an explicit capture call).
+        if (transactions.findById(txnId).map(t -> t.getState()).orElse(TransactionState.AUTHORISED)
+                != TransactionState.CAPTURE_INITIATED) {
+            states.applyTransition(txnId, TransactionState.CAPTURE_INITIATED, "orchestrator", "gateway=" + gw);
+        }
         try {
             long started = System.currentTimeMillis();
             long amount = transactions.findById(txnId).orElseThrow().getAmountPaise();
@@ -221,6 +253,12 @@ public class PaymentService {
     public Transaction getTransaction(String txnId) {
         return transactions.findById(txnId)
                 .orElseThrow(() -> new IllegalArgumentException("transaction not found: " + txnId));
+    }
+
+    public String getByKey(String idempotencyKey) {
+        return transactions.findByIdempotencyKey(idempotencyKey)
+                .orElseThrow(() -> new IllegalArgumentException("no transaction for key " + idempotencyKey))
+                .getId();
     }
 
     public List<Transaction> viewAllByOrder(String merchantOrderId) {

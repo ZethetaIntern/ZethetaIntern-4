@@ -6,3 +6,4 @@ target/
 build.log
 mvn_out.txt
 mvn_err.txt
+app.log

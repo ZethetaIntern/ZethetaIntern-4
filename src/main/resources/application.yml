@@ -1,6 +1,8 @@
 spring:
   datasource:
-    url: ${PAYFLOW_DB_URL:jdbc:h2:mem:payflow;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    # Default: embedded H2 in PostgreSQL compatibility mode (dev/tests).
+    # Production: run with --spring.profiles.active=postgres (see docker-compose.yml).
+    url: ${PAYFLOW_DB_URL:jdbc:h2:mem:payflow;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1}
     username: ${PAYFLOW_DB_USER:sa}
     password: ${PAYFLOW_DB_PASSWORD:}
     driver-class-name: ${PAYFLOW_DB_DRIVER:org.h2.Driver}
@@ -8,12 +10,16 @@ spring:
     hibernate:
       ddl-auto: update
     open-in-view: false
-    properties:
-      hibernate:
-        format_sql: false
   h2:
     console:
       enabled: true
+
+springdoc:
+  # OpenAPI 3.0.1 (swagger-core supported version) — matches docs/api-specification.yaml
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
 
 payflow:
   api-key: ${PAYFLOW_API_KEY:pk_test_payflow}
@@ -23,22 +29,22 @@ payflow:
   reconciliation-interval-ms: ${PAYFLOW_RECON_INTERVAL_MS:60000}
 
 ---
-# Production profile: MySQL (doc specifies PostgreSQL 15+; MySQL selected per user requirement)
+# Production profile: PostgreSQL 15+ (per project brief)
 spring:
   config:
     activate:
-      on-profile: mysql
+      on-profile: postgres
   datasource:
-    url: ${PAYFLOW_DB_URL:jdbc:mysql://localhost:3306/payflow?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    url: ${PAYFLOW_DB_URL:jdbc:postgresql://localhost:5432/payflow}
     username: ${PAYFLOW_DB_USER:payflow}
     password: ${PAYFLOW_DB_PASSWORD:payflow}
-    driver-class-name: com.mysql.cj.jdbc.Driver
+    driver-class-name: org.postgresql.Driver
   jpa:
     hibernate:
-      ddl-auto: validate
+      ddl-auto: update
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.MySQLDialect
+        dialect: org.hibernate.dialect.PostgreSQLDialect
   h2:
     console:
       enabled: false

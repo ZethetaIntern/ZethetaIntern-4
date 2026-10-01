@@ -26,7 +26,10 @@ public class ApiKeyFilter extends OncePerRequestFilter {
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                     FilterChain chain) throws ServletException, IOException {
         String path = request.getRequestURI();
-        if (path.startsWith("/webhooks") || path.equals("/health") || path.startsWith("/h2-console")) {
+        // Webhooks authenticate via HMAC; health and API-docs are public.
+        if (path.startsWith("/webhooks") || path.equals("/health")
+                || path.startsWith("/v3/api-docs") || path.startsWith("/v3/api-docs/")
+                || path.startsWith("/swagger-ui") || path.startsWith("/h2-console")) {
             chain.doFilter(request, response);
             return;
         }

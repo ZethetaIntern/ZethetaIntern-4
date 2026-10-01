@@ -38,8 +38,13 @@ public class ReconciliationService {
     }
 
     public String runOnce() {
+        return runOnce(java.time.Duration.ofMinutes(10));
+    }
+
+    /** Flags transactions stuck in an intermediate state for longer than the threshold. */
+    public String runOnce(java.time.Duration stuckThreshold) {
         String runId = "recon_" + UUID.randomUUID().toString().substring(0, 8);
-        Instant cutoff = Instant.now().minus(10, ChronoUnit.MINUTES);
+        Instant cutoff = Instant.now().minus(stuckThreshold);
         List<TransactionState> unknown = List.of(
                 TransactionState.ROUTING, TransactionState.AUTH_INITIATED,
                 TransactionState.CAPTURE_INITIATED, TransactionState.RETRYING);

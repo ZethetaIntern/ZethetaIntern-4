@@ -1,0 +1,482 @@
+openapi: 3.0.1
+info:
+  title: PayFlow Payment Orchestration Layer API
+  description: |
+    Routes transactions across Razorpay, Stripe, PayU and UPI gateways with
+    intelligent routing (success rate, cost, speed, health), sub-2-second
+    failover, idempotency, two-phase authorise/capture lifecycle, HMAC-verified
+    webhook ingestion with deduplication, and a scheduled reconciliation engine.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+tags:
+  - { name: Payments }
+  - { name: Webhooks }
+  - { name: Routing }
+  - { name: Admin }
+security:
+  - ApiKeyAuth: []
+
+paths:
+  /payments:
+    post:
+      tags: [Payments]
+      summary: Create and process a payment end-to-end
+      description: Idempotent — replaying with the same Idempotency-Key returns the original transaction (HTTP 200, replayed=true).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePaymentRequest' }
+            example: { merchantOrderId: ORD-1001, amount: 250000, currency: INR, paymentMethod: card }
+      responses:
+        '201':
+          description: Payment created and processed to a terminal state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentResponse' }
+        '200':
+          description: Idempotent replay of an existing payment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  replayed: { type: boolean }
+                  transaction_id: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /payments/{id}:
+    get:
+      tags: [Payments]
+      summary: Get a transaction with attempts, audit trail and refunds
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Transaction view
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TransactionView' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/{id}/audit:
+    get:
+      tags: [Payments]
+      summary: Immutable audit trail of state transitions
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Ordered state-transition log
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StateLogEntry' }
+
+  /payments/{id}/attempts:
+    get:
+      tags: [Payments]
+      summary: Gateway attempt records
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Attempt list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GatewayAttempt' }
+
+  /payments/order/{merchantOrderId}:
+    get:
+      tags: [Payments]
+      summary: List transactions for a merchant order
+      parameters:
+        - { name: merchantOrderId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Transaction list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Transaction' }
+
+  /payments/{id}/capture:
+    post:
+      tags: [Payments]
+      summary: Capture an authorised transaction (phase 2 of the two-phase flow)
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Final transaction after capture attempt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /payments/{id}/refund:
+    post:
+      tags: [Payments]
+      summary: Refund a captured/authorised transaction
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+        - { name: amount, in: query, required: false, description: Amount in paise; defaults to captured amount, schema: { type: integer, format: int64 } }
+      responses:
+        '200':
+          description: Refunded transaction
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /payments/{id}/refunds:
+    get:
+      tags: [Payments]
+      summary: Refund records for a transaction
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Refund list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Refund' }
+
+  /webhooks/{gateway}:
+    post:
+      tags: [Webhooks]
+      summary: Ingest a gateway webhook
+      description: >
+        Verifies the HMAC signature (SHA-256; SHA-512 for payu) in constant
+        time, deduplicates on (gateway, event_id), then reconciles the event
+        onto the transaction state machine. Duplicate deliveries are
+        acknowledged idempotently without reprocessing.
+      security: []
+      parameters:
+        - { name: gateway, in: path, required: true, schema: { type: string, enum: [razorpay, stripe, payu, upi] } }
+        - { name: X-Payflow-Signature, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookPayload' }
+      responses:
+        '200':
+          description: Accepted (possibly deduplicated)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookResult' }
+        '401':
+          description: Invalid signature
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookResult' }
+
+  /routing/preview:
+    get:
+      tags: [Routing]
+      summary: Live gateway ranking for a payment
+      parameters:
+        - { name: paymentMethod, in: query, schema: { type: string, default: card } }
+        - { name: amount, in: query, schema: { type: integer, format: int64, default: 100000 } }
+      responses:
+        '200':
+          description: Ranked gateways (descending score)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RankedGateway' }
+
+  /routing/weights:
+    get:
+      tags: [Routing]
+      summary: Current routing weights (stored in DB, tunable without redeploy)
+      responses:
+        '200':
+          description: Weight map
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingWeights' }
+    put:
+      tags: [Routing]
+      summary: Update routing weights at runtime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RoutingWeights' }
+      responses:
+        '200':
+          description: Updated weight map
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoutingWeights' }
+
+  /admin/gateways:
+    get:
+      tags: [Admin]
+      summary: Gateway configurations and rolling health metrics
+      responses:
+        '200':
+          description: Gateway list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/GatewayRoute' }
+
+  /admin/gateways/{gateway}/health:
+    post:
+      tags: [Admin]
+      summary: Force gateway health (failover drills)
+      parameters:
+        - { name: gateway, in: path, required: true, schema: { type: string } }
+        - { name: healthy, in: query, required: true, schema: { type: boolean } }
+      responses:
+        '200': { description: Updated health }
+
+  /admin/reconciliation/run:
+    post:
+      tags: [Admin]
+      summary: Trigger the reconciliation batch engine
+      responses:
+        '200':
+          description: Run identifier
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runId: { type: string }
+
+  /admin/reconciliation:
+    get:
+      tags: [Admin]
+      summary: Reconciliation discrepancy log
+      responses:
+        '200':
+          description: Reconciliation entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ReconciliationLog' }
+
+  /admin/stats:
+    get:
+      tags: [Admin]
+      summary: Basic system statistics
+      responses:
+        '200': { description: Stats map }
+
+  /health:
+    get:
+      tags: [Admin]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200': { description: Service is up }
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    TransactionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: Illegal state transition
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+    CreatePaymentRequest:
+      type: object
+      required: [merchantOrderId, amount, paymentMethod]
+      properties:
+        merchantOrderId: { type: string }
+        amount: { type: integer, format: int64, description: Amount in paise (smallest currency unit) }
+        currency: { type: string, default: INR }
+        paymentMethod: { type: string, enum: [card, netbanking, upi, wallet] }
+
+    Transaction:
+      type: object
+      properties:
+        id: { type: string }
+        idempotencyKey: { type: string }
+        merchantOrderId: { type: string }
+        amountPaise: { type: integer, format: int64 }
+        currency: { type: string }
+        paymentMethod: { type: string }
+        state:
+          type: string
+          enum: [CREATED, ROUTING, AUTH_INITIATED, AUTHORISED, CAPTURE_INITIATED,
+                 CAPTURED, PARTIALLY_CAPTURED, CAPTURE_FAILED, AUTH_FAILED,
+                 RETRYING, FAILED_TERMINAL, REFUND_INITIATED, REFUNDED]
+        gateway: { type: string, nullable: true }
+        gatewayReference: { type: string, nullable: true }
+        failureReason: { type: string, nullable: true }
+        attemptsMade: { type: integer }
+        capturedPaise: { type: integer, format: int64 }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    StateLogEntry:
+      type: object
+      properties:
+        id: { type: string }
+        transactionId: { type: string }
+        fromState: { type: string, nullable: true }
+        toState: { type: string, nullable: true }
+        actor: { type: string }
+        detail: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    GatewayAttempt:
+      type: object
+      properties:
+        transactionId: { type: string }
+        gateway: { type: string }
+        attemptNo: { type: integer }
+        outcome: { type: string, enum: [SUCCESS, DECLINED, TIMEOUT] }
+        latencyMs: { type: integer, format: int64 }
+        error: { type: string, nullable: true }
+
+    Refund:
+      type: object
+      properties:
+        id: { type: string }
+        transactionId: { type: string }
+        amountPaise: { type: integer, format: int64 }
+        gateway: { type: string }
+        status: { type: string }
+        createdAt: { type: string, format: date-time }
+
+    TransactionView:
+      type: object
+      properties:
+        txn: { $ref: '#/components/schemas/Transaction' }
+        attempts:
+          type: array
+          items: { $ref: '#/components/schemas/GatewayAttempt' }
+        audit:
+          type: array
+          items: { $ref: '#/components/schemas/StateLogEntry' }
+        refundList:
+          type: array
+          items: { $ref: '#/components/schemas/Refund' }
+
+    PaymentResponse:
+      type: object
+      properties:
+        replayed: { type: boolean }
+        transaction: { $ref: '#/components/schemas/Transaction' }
+
+    WebhookPayload:
+      type: object
+      required: [event_id, status]
+      properties:
+        event_id: { type: string }
+        event_type: { type: string, example: payment.succeeded }
+        status: { type: string, enum: [succeeded, failed, refunded] }
+        gateway_reference: { type: string }
+        transaction_id: { type: string }
+
+    WebhookResult:
+      type: object
+      properties:
+        accepted: { type: boolean }
+        deduplicated: { type: boolean }
+        reconciled: { type: boolean }
+        transactionId: { type: string, nullable: true }
+        reason: { type: string, nullable: true }
+
+    RankedGateway:
+      type: object
+      properties:
+        route: { $ref: '#/components/schemas/GatewayRoute' }
+        score: { type: number, format: double }
+
+    GatewayRoute:
+      type: object
+      properties:
+        gateway: { type: string }
+        supportsUpi: { type: boolean }
+        costBps: { type: integer }
+        fixedCostPaise: { type: integer }
+        baseLatencyMs: { type: integer }
+        healthy: { type: boolean }
+        successCount: { type: integer }
+        failureCount: { type: integer }
+        totalLatencyMs: { type: integer, format: int64 }
+        consecutiveFailures: { type: integer }
+        circuitOpenUntil: { type: string, format: date-time }
+
+    RoutingWeights:
+      type: object
+      properties:
+        success: { type: number, format: double }
+        latency: { type: number, format: double }
+        cost: { type: number, format: double }
+        health: { type: number, format: double }
+        methodFit: { type: number, format: double }
+
+    ReconciliationLog:
+      type: object
+      properties:
+        id: { type: string }
+        runId: { type: string }
+        transactionId: { type: string, nullable: true }
+        discrepancyType: { type: string }
+        detail: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            timestamp: { type: string, format: date-time }

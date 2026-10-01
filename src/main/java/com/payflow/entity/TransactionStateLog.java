@@ -21,8 +21,9 @@ public class TransactionStateLog {
     @Enumerated(EnumType.STRING)
     private TransactionState fromState;
 
+    /** Nullable: attempt/audit records are logged without a state transition. */
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = true)
     private TransactionState toState;
 
     @Column(nullable = false)

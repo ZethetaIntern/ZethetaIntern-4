@@ -1,25 +1,24 @@
 services:
-  mysql:
-    image: mysql:8.4
+  postgres:
+    image: postgres:15-alpine
     environment:
-      MYSQL_DATABASE: payflow
-      MYSQL_USER: payflow
-      MYSQL_PASSWORD: payflow
-      MYSQL_ROOT_PASSWORD: root
+      POSTGRES_DB: payflow
+      POSTGRES_USER: payflow
+      POSTGRES_PASSWORD: payflow
     ports:
-      - "3306:3306"
+      - "5432:5432"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      test: ["CMD-SHELL", "pg_isready -U payflow -d payflow"]
       interval: 5s
       retries: 10
 
   app:
     build: .
     depends_on:
-      mysql:
+      postgres:
         condition: service_healthy
     environment:
-      PAYFLOW_DB_URL: jdbc:mysql://mysql:3306/payflow?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      PAYFLOW_DB_URL: jdbc:postgresql://postgres:5432/payflow
       PAYFLOW_DB_USER: payflow
       PAYFLOW_DB_PASSWORD: payflow
       PAYFLOW_API_KEY: pk_test_payflow
