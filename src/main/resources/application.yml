@@ -1,0 +1,44 @@
+spring:
+  datasource:
+    url: ${PAYFLOW_DB_URL:jdbc:h2:mem:payflow;MODE=MySQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1}
+    username: ${PAYFLOW_DB_USER:sa}
+    password: ${PAYFLOW_DB_PASSWORD:}
+    driver-class-name: ${PAYFLOW_DB_DRIVER:org.h2.Driver}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+  h2:
+    console:
+      enabled: true
+
+payflow:
+  api-key: ${PAYFLOW_API_KEY:pk_test_payflow}
+  webhook-secret: ${PAYFLOW_WEBHOOK_SECRET:whsec_test_secret}
+  attempt-timeout-millis: ${PAYFLOW_ATTEMPT_TIMEOUT_MS:2000}
+  max-gateway-attempts: ${PAYFLOW_MAX_ATTEMPTS:3}
+  reconciliation-interval-ms: ${PAYFLOW_RECON_INTERVAL_MS:60000}
+
+---
+# Production profile: MySQL (doc specifies PostgreSQL 15+; MySQL selected per user requirement)
+spring:
+  config:
+    activate:
+      on-profile: mysql
+  datasource:
+    url: ${PAYFLOW_DB_URL:jdbc:mysql://localhost:3306/payflow?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC}
+    username: ${PAYFLOW_DB_USER:payflow}
+    password: ${PAYFLOW_DB_PASSWORD:payflow}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect
+  h2:
+    console:
+      enabled: false
