@@ -15,18 +15,19 @@ public class ProcessedWebhookEvent {
     @Column(name = "event_key", nullable = false, updatable = false, length = 320)
     private String eventKey; // gateway + ":" + eventId
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String gateway;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 255)
     private String eventId;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 100)
     private String eventType;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 64)
     private String payloadHash;
 
+    @Column(length = 36)
     private String transactionId;
 
     @Column(nullable = false, updatable = false)

@@ -14,38 +14,41 @@ import java.util.UUID;
                 columnNames = {"merchant_id", "idempotency_key"}))
 public class Transaction {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(name = "idempotency_key", nullable = false)
+    @Column(name = "idempotency_key", nullable = false, length = 255)
     private String idempotencyKey;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 255)
     private String merchantOrderId;
 
     /** Merchant scope for idempotency (FS-13): key uniqueness is (merchant_id, key). */
-    @Column(name = "merchant_id", nullable = false)
+    @Column(name = "merchant_id", nullable = false, length = 255)
     private String merchantId = "default";
 
     @Column(nullable = false)
     private long amountPaise;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 8)
     private String currency = "INR";
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 32)
     private String paymentMethod;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 32)
     private TransactionState state = TransactionState.CREATED;
 
     @Version
     @Column(nullable = false)
     private long version;
 
+    @Column(length = 32)
     private String gateway;
+    @Column(length = 255)
     private String gatewayReference;
+    @Column(length = 512)
     private String failureReason;
     private int attemptsMade;
     private long capturedPaise;

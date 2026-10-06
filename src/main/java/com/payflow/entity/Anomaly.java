@@ -18,23 +18,23 @@ public class Anomaly {
     public enum Severity { WARNING, CRITICAL }
 
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(name = "run_id", nullable = false, updatable = false)
+    @Column(name = "run_id", nullable = false, updatable = false, length = 64)
     private String runId;
 
-    @Column(name = "transaction_id", nullable = false, updatable = false)
+    @Column(name = "transaction_id", nullable = false, updatable = false, length = 36)
     private String transactionId;
 
-    @Column(name = "internal_state", nullable = false, updatable = false)
+    @Column(name = "internal_state", nullable = false, updatable = false, length = 32)
     private String internalState;
 
-    @Column(name = "gateway_status", nullable = false, updatable = false)
+    @Column(name = "gateway_status", nullable = false, updatable = false, length = 32)
     private String gatewayStatus;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 16)
     private Severity severity = Severity.CRITICAL;
 
     @Column(columnDefinition = "TEXT", updatable = false)

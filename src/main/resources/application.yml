@@ -13,6 +13,8 @@ spring:
   h2:
     console:
       enabled: true
+  flyway:
+    enabled: false
 
 springdoc:
   # OpenAPI 3.0.1 (swagger-core supported version) — matches docs/api-specification.yaml
@@ -25,6 +27,7 @@ payflow:
   api-key: ${PAYFLOW_API_KEY:pk_test_payflow}
   webhook-secret: ${PAYFLOW_WEBHOOK_SECRET:whsec_test_secret}
   attempt-timeout-millis: ${PAYFLOW_ATTEMPT_TIMEOUT_MS:2000}
+  failover-timeout-millis: ${PAYFLOW_FAILOVER_TIMEOUT_MS:2000}
   max-gateway-attempts: ${PAYFLOW_MAX_ATTEMPTS:3}
   reconciliation-interval-ms: ${PAYFLOW_RECON_INTERVAL_MS:60000}
 
@@ -37,14 +40,19 @@ spring:
   datasource:
     url: ${PAYFLOW_DB_URL:jdbc:postgresql://localhost:5432/payflow}
     username: ${PAYFLOW_DB_USER:payflow}
-    password: ${PAYFLOW_DB_PASSWORD:payflow}
+    password: ${PAYFLOW_DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
   h2:
     console:
       enabled: false
+  flyway:
+    enabled: true
+payflow:
+  api-key: ${PAYFLOW_API_KEY}
+  webhook-secret: ${PAYFLOW_WEBHOOK_SECRET}

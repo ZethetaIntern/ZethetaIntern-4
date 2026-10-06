@@ -6,6 +6,14 @@ import com.payflow.repository.GatewayHourlyMetricRepository;
 import com.payflow.service.DeadLetterQueueService;
 import com.payflow.service.GatewayRateLimiter;
 import com.payflow.util.PiiSanitizer;
+import com.payflow.entity.Anomaly;
+import com.payflow.entity.GatewayRouteSelection;
+import com.payflow.entity.WebhookQueueItem;
+import com.payflow.entity.ProcessedWebhookEvent;
+import com.payflow.entity.Refund;
+import com.payflow.entity.ReconciliationLog;
+import com.payflow.entity.GatewayHourlyMetric;
+import com.payflow.gateway.GatewayClient;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -72,6 +80,14 @@ class PlatformServicesTest {
         assertTrue(System.currentTimeMillis() - start < 500, "in-budget calls must not be delayed");
     }
 
+    @Test
+    void nonBlockingRateLimitAdmissionRejectsExcessTraffic() {
+        for (int i = 0; i < 100; i++) {
+            assertTrue(rateLimiter.tryAcquire("test-gateway"));
+        }
+        assertFalse(rateLimiter.tryAcquire("test-gateway"));
+    }
+
     // --- A8.3 dead letter queue ----------------------------------------------------
 
     @Test
@@ -112,5 +128,96 @@ class PlatformServicesTest {
     @Test
     void maskCardKeepsLastFour() {
         assertEquals("************1111", PiiSanitizer.maskCard("4111111111111111"));
+    }
+
+    @Test
+    void immutableRecordModelsExposeTheirState() {
+        var anomaly = new Anomaly("run-1", "txn-1", "CAPTURED", "FAILED",
+                Anomaly.Severity.CRITICAL, "status mismatch");
+        anomaly.setAlerted(true);
+        assertNotNull(anomaly.getId());
+        assertEquals("run-1", anomaly.getRunId());
+        assertEquals("txn-1", anomaly.getTransactionId());
+        assertEquals("CAPTURED", anomaly.getInternalState());
+        assertEquals("FAILED", anomaly.getGatewayStatus());
+        assertEquals(Anomaly.Severity.CRITICAL, anomaly.getSeverity());
+        assertEquals("status mismatch", anomaly.getDetail());
+        assertTrue(anomaly.isAlerted());
+        assertNotNull(anomaly.getCreatedAt());
+
+        var selection = new GatewayRouteSelection("txn-1", "stripe", 0.9, 1, 0);
+        assertNotNull(selection.getId());
+        assertEquals("txn-1", selection.getTransactionId());
+        assertEquals("stripe", selection.getGateway());
+        assertEquals(0.9, selection.getScore());
+        assertEquals(1, selection.getRank());
+        assertEquals(0, selection.getAttemptNo());
+        assertNotNull(selection.getCreatedAt());
+
+        var queued = new WebhookQueueItem("razorpay", "evt-1", "{}", "signature");
+        assertNotNull(queued.getId());
+        assertEquals("razorpay", queued.getGateway());
+        assertEquals("evt-1", queued.getEventId());
+        assertEquals("{}", queued.getPayload());
+        assertEquals("signature", queued.getSignature());
+        assertEquals(WebhookQueueItem.Status.PENDING, queued.getStatus());
+        assertEquals(0, queued.getRetryCount());
+        assertEquals(3, queued.getMaxRetries());
+        queued.incrementRetries();
+        queued.setErrorMessage("retry");
+        queued.setStatus(WebhookQueueItem.Status.FAILED);
+        queued.setProcessedAt(java.time.Instant.now());
+        assertEquals(1, queued.getRetryCount());
+        assertEquals("retry", queued.getErrorMessage());
+        assertNotNull(queued.getProcessedAt());
+
+        var error = new GatewayClient.GatewayException("stripe", "DECLINED", "declined");
+        assertEquals("stripe", error.gateway);
+        assertEquals("DECLINED", error.code);
+        assertEquals("declined", error.getMessage());
+        assertEquals("TIMEOUT", new GatewayClient.GatewayTimeout("upi").code);
+    }
+
+    @Test
+    void sanitizerHandlesNullAndShortCardValues() {
+        assertNull(PiiSanitizer.sanitize(null));
+        assertEquals("[CARD_REDACTED]", PiiSanitizer.maskCard("123"));
+    }
+
+    @Test
+    void auditAndMetricEntitiesRetainTheirFields() {
+        var event = new ProcessedWebhookEvent("stripe", "evt-2", "payment.succeeded",
+                "payload-hash", "txn-2");
+        assertEquals("stripe:evt-2", event.getEventKey());
+        assertEquals("stripe", event.getGateway());
+        assertEquals("evt-2", event.getEventId());
+        assertEquals("payment.succeeded", event.getEventType());
+        assertEquals("payload-hash", event.getPayloadHash());
+        assertEquals("txn-2", event.getTransactionId());
+        assertNotNull(event.getProcessedAt());
+
+        var refund = new Refund("txn-2", 1500, "stripe", "PROCESSED");
+        assertNotNull(refund.getId());
+        assertEquals("txn-2", refund.getTransactionId());
+        assertEquals(1500, refund.getAmountPaise());
+        assertEquals("stripe", refund.getGateway());
+        assertEquals("PROCESSED", refund.getStatus());
+        assertNotNull(refund.getCreatedAt());
+
+        var reconciliation = new ReconciliationLog("recon-2", "txn-2", "MISMATCH", "manual review");
+        assertNotNull(reconciliation.getId());
+        assertEquals("recon-2", reconciliation.getRunId());
+        assertEquals("txn-2", reconciliation.getTransactionId());
+        assertEquals("MISMATCH", reconciliation.getDiscrepancyType());
+        assertEquals("manual review", reconciliation.getDetail());
+        assertNotNull(reconciliation.getCreatedAt());
+
+        var metric = new GatewayHourlyMetric("stripe", java.time.Instant.now(), 0.99, 200, 100);
+        assertEquals("stripe", metric.getGateway());
+        assertNotNull(metric.getId());
+        assertNotNull(metric.getRecordedAt());
+        assertEquals(0.99, metric.getSuccessRate());
+        assertEquals(200, metric.getP95LatencyMs());
+        assertEquals(100, metric.getTransactionCount());
     }
 }

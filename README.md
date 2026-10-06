@@ -1,46 +1,54 @@
 # PayFlow — Payment Orchestration Layer (Java 21 / Spring Boot / PostgreSQL 15+)
 
-Payment orchestration back-end routing transactions across **Razorpay, Stripe,
-PayU and UPI** with intelligent routing, <2s failover, idempotency, two-phase
-authorise/capture lifecycle, webhook reconciliation with deduplication, and a
-complete audit trail.
+Payment orchestration back-end with simulated gateway adapters for **Razorpay,
+Stripe, PayU and UPI**, intelligent routing, a 2-second end-to-end authorization
+failover budget, idempotency, two-phase authorise/capture lifecycle, webhook
+reconciliation with deduplication, and an audit trail.
 
 Implements the *Payment Orchestration Layer* brief end to end:
 
 | Brief section | Implementation |
 |---|---|
-| A3 Routing algorithm | `core/RoutingEngine` — weighted score (success/latency/cost/health/method), Laplace prior, circuit breaker, historical dataset seeded into `gateway_routes` |
+| A3 Routing algorithm | `core/RoutingEngine` — weighted score (15-minute success/P95 latency, cost, health, method fit), historical cold-start data, circuit breaker |
 | A3.3 Weights in DB | `routing_config` table + `GET/PUT /routing/weights` (tunable without redeploy) |
-| A4/A5 State machine | `domain/TransactionState` + `service/StateService` — 13 states, validated transitions, immutable `transaction_state_log` |
+| A4/A5 State machine | `domain/TransactionState` + `service/StateService` — 18 states, validated transitions, immutable `transaction_state_log` |
 | A4.2 Locking | Pessimistic lock around transitions only, `@Version` optimistic locking, no locks during gateway I/O |
-| A5 Webhook pipeline | `service/WebhookService` — constant-time HMAC (SHA-256/512), `PK(gateway,event_id)` dedup, reconciliation onto the FSM |
+| A5 Webhook pipeline | `service/WebhookService` — constant-time HMAC (SHA-256/512), per-event database lock and `(gateway,event_id)` dedup, reconciliation onto the FSM |
 | A5.5 Reconciliation | `service/ReconciliationService` — scheduled batch flagging stuck intermediate states |
-| A6 Database | PostgreSQL 15+ schema: `docs/db/postgres-schema.sql` |
-| A7 API | 16 endpoints, OpenAPI 3.0.1 at `docs/api-specification.yaml` + live docs `/swagger-ui.html`, `/v3/api-docs` |
-| Part B FS-01..FS-15 | All 15 failure scenarios covered in `tests/FailureScenarioTests.java` |
-| Part D Quality | JaCoCo coverage report (`target/site/jacoco`), Docker + docker-compose |
+| A6 Database | PostgreSQL 15+ Flyway migration: `src/main/resources/db/migration/V1__initial_schema.sql` |
+| A7 API | 23 API operations, OpenAPI 3.0.1 at `docs/api-specification.yaml` + live docs `/swagger-ui.html`, `/v3/api-docs` |
+| Part B FS-01..FS-15 | All 15 failure scenarios covered in `src/test/java/com/payflow/FailureScenarioTests.java` |
+| Part D Quality | JaCoCo line coverage gate (80%), coverage report (`target/site/jacoco`), Docker + docker-compose |
 
 ## Run
 
 ```bash
 # Tests (H2 in PostgreSQL-compat mode; no external DB required)
 mvnw.cmd test          # Windows  (mvn test elsewhere)
-# Coverage report: target/site/jacoco/index.html
+# Coverage report: target/site/jacoco/index.html; Maven verify enforces 80% line coverage
 
 # App with embedded H2
 mvnw.cmd spring-boot:run
 
-# Full stack: PostgreSQL 15 + app
+# Local/demo stack: PostgreSQL 15 + simulated gateway adapters
 docker compose up --build          # app :8080, postgres :5432
 ```
 
 Live API docs: http://localhost:8080/swagger-ui.html
 
+The gateway clients are deterministic simulators for the project failure
+scenarios; this repository does not contain live Razorpay, Stripe, PayU, or NPCI
+connectors. The PostgreSQL profile requires explicit `PAYFLOW_API_KEY`,
+`PAYFLOW_WEBHOOK_SECRET`, and `PAYFLOW_DB_PASSWORD` values. The credentials in
+`docker-compose.yml` are local demo values only and must not be used in a
+deployed environment. Production schema changes run through Flyway; Hibernate
+is set to validate the resulting schema.
+
 ## Failure scenarios (Part B) — all passing
 
 | ID | Scenario | Asserted behaviour |
 |---|---|---|
-| FS-01 | Auth timeout | Failover completes < 2s, TIMEOUT attempt recorded, payment captured |
+| FS-01 | Delayed auth timeout | A delayed primary timeout followed by alternate-gateway success stays within 2s |
 | FS-02 | Duplicate webhook ×3 | Processed once; duplicates deduplicated |
 | FS-03 | Double submit | Second request resolves to the original transaction |
 | FS-04 | 5xx on capture | `CAPTURE_FAILED` + audit entry |
@@ -77,7 +85,7 @@ Live API docs: http://localhost:8080/swagger-ui.html
 | POST | `/admin/reconciliation/run` | Trigger reconciliation batch |
 | GET | `/admin/reconciliation` | Reconciliation discrepancy log |
 
-Headers: `X-API-Key: pk_test_payflow` (default). Webhook signature:
+Local/demo headers: `X-API-Key: pk_test_payflow`. Webhook signature:
 HMAC-SHA256 (SHA-512 for PayU) of the raw body with `whsec_test_secret`.
 
 ## Architecture
@@ -88,8 +96,8 @@ See `docs/architecture.md` and `docs/routing-algorithm.md`.
 POST /payments ─▶ IdempotencyKey store ─▶ RoutingEngine (DB weights + health)
                     │                          │ ranked gateways
                     ▼                          ▼
-              Transaction ◀── StateService ◀─ failover loop (2s/attempt)
-              (pessimistic lock                 │ Future.get(2s) per gateway
+              Transaction ◀── StateService ◀─ failover loop (shared 2s deadline)
+              (pessimistic lock                 │ Shared 2s authorization deadline
                on transitions only)             ▼
                                          authorize ─▶ capture (two-phase)
 POST /webhooks/{gw} ─▶ HMAC verify ─▶ dedup PK(gateway,event_id) ─▶ reconcile
@@ -103,7 +111,9 @@ POST /webhooks/{gw} ─▶ HMAC verify ─▶ dedup PK(gateway,event_id) ─▶ 
 |---|---|---|
 | `PAYFLOW_API_KEY` | `pk_test_payflow` | API auth |
 | `PAYFLOW_WEBHOOK_SECRET` | `whsec_test_secret` | Webhook HMAC secret |
-| `PAYFLOW_ATTEMPT_TIMEOUT_MS` | `2000` | Per-gateway failover budget |
+| `PAYFLOW_ATTEMPT_TIMEOUT_MS` | `2000` | Maximum wait for one gateway response |
+| `PAYFLOW_FAILOVER_TIMEOUT_MS` | `2000` | End-to-end authorization/failover deadline |
 | `PAYFLOW_MAX_ATTEMPTS` | `3` | Max gateways tried per transaction |
-| `PAYFLOW_DB_URL` | H2 in-mem (MySQL mode) | Use MySQL JDBC URL in prod |
-| Profile `mysql` | — | Activates MySQL datasource |
+| `PAYFLOW_DB_URL` | H2 in-mem (PostgreSQL mode) | PostgreSQL JDBC URL when using the `postgres` profile |
+| `PAYFLOW_API_KEY` / `PAYFLOW_WEBHOOK_SECRET` | Test-only defaults | Required in the `postgres` profile |
+| `PAYFLOW_DB_PASSWORD` | Empty for H2 | Required in the `postgres` profile |

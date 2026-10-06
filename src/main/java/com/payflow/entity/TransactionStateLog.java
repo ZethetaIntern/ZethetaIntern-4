@@ -12,21 +12,22 @@ import java.util.UUID;
         @Index(name = "idx_log_created", columnList = "createdAt")})
 public class TransactionStateLog {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(name = "transaction_id", nullable = false)
+    @Column(name = "transaction_id", nullable = false, length = 36)
     private String transactionId;
 
     @Enumerated(EnumType.STRING)
+    @Column(length = 32)
     private TransactionState fromState;
 
     /** Nullable: attempt/audit records are logged without a state transition. */
     @Enumerated(EnumType.STRING)
-    @Column(nullable = true)
+    @Column(nullable = true, length = 32)
     private TransactionState toState;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 64)
     private String actor;
 
     @Column(columnDefinition = "TEXT")

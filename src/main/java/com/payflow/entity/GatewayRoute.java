@@ -8,7 +8,7 @@ import java.time.Instant;
 @Table(name = "gateway_routes")
 public class GatewayRoute {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String gateway;
 
     private boolean supportsUpi = true;
@@ -42,6 +42,9 @@ public class GatewayRoute {
     @Column(nullable = false)
     private Instant circuitOpenUntil = Instant.EPOCH;
 
+    @Column(name = "probe_lease_until", nullable = false)
+    private Instant probeLeaseUntil = Instant.EPOCH;
+
     public String getGateway() { return gateway; }
     public void setGateway(String g) { this.gateway = g; }
     public boolean isSupportsUpi() { return supportsUpi; }
@@ -64,4 +67,6 @@ public class GatewayRoute {
     public void setConsecutiveFailures(int c) { this.consecutiveFailures = c; }
     public Instant getCircuitOpenUntil() { return circuitOpenUntil; }
     public void setCircuitOpenUntil(Instant t) { this.circuitOpenUntil = t; }
+    public boolean isProbeInFlight(Instant now) { return probeLeaseUntil != null && now.isBefore(probeLeaseUntil); }
+    public void setProbeLeaseUntil(Instant probeLeaseUntil) { this.probeLeaseUntil = probeLeaseUntil; }
 }

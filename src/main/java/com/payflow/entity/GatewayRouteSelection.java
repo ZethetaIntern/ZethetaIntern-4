@@ -9,13 +9,13 @@ import java.util.UUID;
 @Table(name = "gateway_route_selections", indexes = @Index(name = "idx_route_sel_txn", columnList = "transaction_id"))
 public class GatewayRouteSelection {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(name = "transaction_id", nullable = false, updatable = false)
+    @Column(name = "transaction_id", nullable = false, updatable = false, length = 36)
     private String transactionId;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String gateway;
 
     @Column(nullable = false)

@@ -58,6 +58,21 @@ public class GatewayRateLimiter {
         return delay;
     }
 
+    /** Non-blocking admission for payment requests with a hard end-to-end deadline. */
+    public boolean tryAcquire(String gateway) {
+        Limit limit = LIMITS.getOrDefault(gateway, new Limit(100, 100));
+        Bucket b = buckets.computeIfAbsent(gateway, k -> new Bucket(limit));
+        synchronized (b) {
+            long now = System.nanoTime();
+            double elapsedSeconds = (now - b.lastRefillNanos) / 1_000_000_000.0;
+            b.tokens = Math.min(b.limit.capacity(), b.tokens + elapsedSeconds * b.limit.refillPerSecond());
+            b.lastRefillNanos = now;
+            if (b.tokens < 1.0) return false;
+            b.tokens -= 1.0;
+            return true;
+        }
+    }
+
     /** Current utilisation, e.g. { razorpay: "199/200 req/sec" }. */
     public Map<String, String> utilisation() {
         Map<String, String> out = new ConcurrentHashMap<>();

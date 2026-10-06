@@ -18,7 +18,7 @@
    ┌──────────────── PaymentService.process() ────────────────┐
    │ for each ranked gateway:                                  │
    │   StateService.applyTransition (pessimistic lock)        │
-   │   gateway.authorize()  ← Future.get(2000ms) hard budget  │
+   │   gateway.authorize()  ← shared 2000ms failover deadline  │
    │   success → AUTHORISED → captureFlow() → CAPTURED        │
    │   failure → AUTH_FAILED → RETRYING → next gateway        │
    └───────────────────────────────────────────────────────────┘
@@ -64,18 +64,19 @@ CREATED ──▶ ROUTING ──▶ AUTH_INITIATED ──▶ AUTHORISED ──�
 
 ## Database (PostgreSQL 15+)
 
-Schema: `docs/db/postgres-schema.sql` — `transactions`,
+Schema: Flyway migration `src/main/resources/db/migration/V1__initial_schema.sql` — `transactions`,
 `transaction_state_log` (immutable audit), `gateway_routes` (config + health
 metrics), `routing_config` (hot-tunable weights), `gateway_attempts`,
 `idempotency_keys` (24h expiry), `processed_webhook_events`,
 `reconciliation_log`, `refunds`.
 
-Hibernate `ddl-auto=update` generates the same schema in dev/test (H2 in
-PostgreSQL compatibility mode) so the suite runs without a database.
+Hibernate `ddl-auto=update` is limited to dev/test (H2 in PostgreSQL
+compatibility mode); the PostgreSQL profile applies Flyway migrations and uses
+`ddl-auto=validate`.
 
 ## Gateway adapters
 
 `GatewayClient` (`authorize` / `capture` / `refund`) is implemented by
 `SimulatedGatewayClient`, whose outcomes are deterministic per reference
 (SHA-256 seeded) so routing, failover and reconciliation are reproducible.
-Production adapters only need to implement the same interface (RestClient).
+Live provider adapters and merchant-specific credentials are not included.

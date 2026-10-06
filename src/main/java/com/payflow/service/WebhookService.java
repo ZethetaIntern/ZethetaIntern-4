@@ -8,14 +8,17 @@ import com.payflow.entity.ProcessedWebhookEvent;
 import com.payflow.entity.Transaction;
 import com.payflow.repository.ProcessedWebhookEventRepository;
 import com.payflow.repository.TransactionRepository;
+import jakarta.persistence.EntityManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.sql.DataSource;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Webhook ingestion pipeline (spec A5):
@@ -33,16 +36,26 @@ public class WebhookService {
     private final StateService states;
     private final PayFlowProperties props;
     private final DeadLetterQueueService deadLetterQueue;
+    private final EntityManager entityManager;
+    private final DataSource dataSource;
+    private volatile Boolean postgres;
+    private static final ReentrantLock[] EVENT_LOCKS = new ReentrantLock[256];
+    static {
+        for (int i = 0; i < EVENT_LOCKS.length; i++) EVENT_LOCKS[i] = new ReentrantLock();
+    }
     private final ObjectMapper mapper = new ObjectMapper();
 
     public WebhookService(ProcessedWebhookEventRepository processed,
                           TransactionRepository transactions, StateService states,
-                          PayFlowProperties props, DeadLetterQueueService deadLetterQueue) {
+                          PayFlowProperties props, DeadLetterQueueService deadLetterQueue,
+                          EntityManager entityManager, DataSource dataSource) {
         this.processed = processed;
         this.transactions = transactions;
         this.states = states;
         this.props = props;
         this.deadLetterQueue = deadLetterQueue;
+        this.entityManager = entityManager;
+        this.dataSource = dataSource;
     }
 
     /** Constant-time HMAC verification (Razorpay/Stripe: HMAC-SHA256; PayU: SHA-512). */
@@ -84,6 +97,43 @@ public class WebhookService {
         if (eventId == null || eventId.isBlank()) {
             return new Result(false, false, false, null, "missing_event_id");
         }
+        String eventKey = gateway + ":" + eventId;
+        ReentrantLock lock = EVENT_LOCKS[Math.floorMod(eventKey.hashCode(), EVENT_LOCKS.length)];
+        lock.lock();
+        try {
+            acquireDatabaseEventLock(eventKey);
+            return ingestVerified(gateway, signatureHeader, body, payload, eventId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private boolean isPostgres() {
+        if (postgres == null) {
+            synchronized (this) {
+                if (postgres == null) {
+                    try (java.sql.Connection connection = dataSource.getConnection()) {
+                        postgres = connection.getMetaData().getDatabaseProductName()
+                                .toLowerCase().contains("postgres");
+                    } catch (java.sql.SQLException e) {
+                        throw new IllegalStateException("Unable to identify webhook database", e);
+                    }
+                }
+            }
+        }
+        return postgres;
+    }
+
+    private void acquireDatabaseEventLock(String eventKey) {
+        if (isPostgres()) {
+            entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(hashtext(:event_key))")
+                    .setParameter("event_key", "webhook_" + eventKey)
+                    .getSingleResult();
+        }
+    }
+
+    private Result ingestVerified(String gateway, String signatureHeader, byte[] body,
+                                  JsonNode payload, String eventId) {
         String eventType = payload.path("event_type").asText("unknown");
         String status = payload.path("status").asText("").toLowerCase();
         String gatewayRef = payload.path("gateway_reference").asText(null);
@@ -91,17 +141,12 @@ public class WebhookService {
         Long amount = payload.hasNonNull("amount") ? payload.get("amount").asLong() : null;
         String currency = payload.path("currency").asText(null);
 
-        // Insert is the dedup gate; PK (gateway:event_id) violation => duplicate.
+        // The per-event lock makes the check-and-insert atomic across app instances.
         if (processed.existsByEventKey(gateway + ":" + eventId)) {
             return new Result(true, true, false, null, "duplicate_event");
         }
-        try {
-            processed.save(new ProcessedWebhookEvent(gateway, eventId, eventType,
-                    sha256Hex(body), txnIdInPayload));
-        } catch (RuntimeException e) {
-            // Concurrent duplicate delivery: the unique key did its job.
-            return new Result(true, true, false, null, "duplicate_event");
-        }
+        processed.saveAndFlush(new ProcessedWebhookEvent(gateway, eventId, eventType,
+                sha256Hex(body), txnIdInPayload));
 
         Result result = reconcile(gateway, eventId, status, gatewayRef, txnIdInPayload, amount, currency);
         if (!result.accepted()) {

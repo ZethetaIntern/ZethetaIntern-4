@@ -20,23 +20,23 @@ public class IdempotencyKey {
 
     /** Composite primary key (merchant_id + key) — FS-13 merchant scoping. */
     @Id
-    @Column(name = "idem_pk", nullable = false, updatable = false)
+    @Column(name = "idem_pk", nullable = false, updatable = false, length = 64)
     private String id;
 
-    @Column(name = "idempotency_key", nullable = false, updatable = false)
+    @Column(name = "idempotency_key", nullable = false, updatable = false, length = 255)
     private String key;
-    @Column(name = "merchant_id", nullable = false, updatable = false)
+    @Column(name = "merchant_id", nullable = false, updatable = false, length = 255)
     private String merchantId;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String transactionId;
 
     /** Hash of the request payload: a different payload on the same key is a conflict. */
-    @Column(name = "request_hash", nullable = false, updatable = false)
+    @Column(name = "request_hash", nullable = false, updatable = false, length = 64)
     private String requestHash;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 16)
     private Status status = Status.PROCESSING;
 
     @Column(nullable = false, updatable = false)
@@ -53,7 +53,13 @@ public class IdempotencyKey {
     }
 
     public static String compositeId(String merchantId, String key) {
-        return merchantId + "::" + key;
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest((merchantId + "\u0000" + key).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     public String getId() { return id; }

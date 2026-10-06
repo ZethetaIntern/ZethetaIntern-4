@@ -151,6 +151,8 @@ public class PaymentService {
 
     /** Full flow: routing -> per-gateway authorise (2s budget, failover) -> capture. */
     public Transaction process(String txnId) {
+        long deadline = System.nanoTime()
+                + TimeUnit.MILLISECONDS.toNanos(props.failoverTimeoutMillis());
         Transaction t = transactions.findById(txnId).orElseThrow();
         List<RoutingEngine.RankedGateway> ranked = routing.rank(t.getPaymentMethod(), t.getAmountPaise());
         if (ranked.isEmpty()) {
@@ -172,13 +174,24 @@ public class PaymentService {
         int attemptNo = 0;
         for (var plan : ranked) {
             String gw = plan.route().getGateway();
+            long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+            if (remainingMs <= 0) {
+                lastError = "authorization failover deadline exceeded";
+                break;
+            }
+            if (!rateLimiter.tryAcquire(gw)) {
+                lastError = "local rate limit skipped " + gw;
+                continue;
+            }
+            if (!routing.tryAcquireProbe(gw)) {
+                lastError = "half-open probe already in flight for " + gw;
+                continue;
+            }
             attemptNo++;
-            // A8.4: respect the gateway's outbound rate limit (delay, never drop).
-            rateLimiter.acquire(gw);
             states.applyTransition(txnId, TransactionState.AUTH_INITIATED, "orchestrator",
                     "gateway=" + gw + " attempt=" + attemptNo);
+            long started = System.nanoTime();
             try {
-                long started = System.currentTimeMillis();
                 final com.payflow.gateway.MockControl control = currentMockControl();
                 Future<GatewayClient.AuthResult> future = gatewayPool.submit(() -> {
                     com.payflow.gateway.MockControl.bind(control);
@@ -190,12 +203,19 @@ public class PaymentService {
                 });
                 GatewayClient.AuthResult auth;
                 try {
-                    auth = future.get(props.attemptTimeoutMillis(), TimeUnit.MILLISECONDS);
+                    remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                    if (remainingMs <= 0) throw new TimeoutException("failover deadline exceeded");
+                    auth = future.get(Math.min(props.attemptTimeoutMillis(), remainingMs), TimeUnit.MILLISECONDS);
                 } catch (TimeoutException te) {
                     future.cancel(true);
                     throw new GatewayClient.GatewayTimeout(gw);
                 }
-                long latency = System.currentTimeMillis() - started;
+                if (!auth.ok()) {
+                    throw new GatewayClient.GatewayException(gw,
+                            auth.errorCode() == null ? "AUTH_FAILED" : auth.errorCode(),
+                            "gateway did not authorize payment");
+                }
+                long latency = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
                 final GatewayClient.AuthResult authResult = auth;
                 routing.recordResult(gw, true, latency);
                 recordAttempt(txnId, gw, attemptNo, AttemptOutcome.SUCCESS, latency, null);
@@ -216,31 +236,33 @@ public class PaymentService {
                 return finalTxn;
             } catch (GatewayClient.GatewayException e) {
                 boolean timeout = e instanceof GatewayClient.GatewayTimeout;
-                routing.recordResult(gw, false, props.attemptTimeoutMillis());
+                long latency = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                routing.recordResult(gw, false, latency);
                 recordAttempt(txnId, gw, attemptNo,
                         timeout ? AttemptOutcome.TIMEOUT : AttemptOutcome.DECLINED,
-                        props.attemptTimeoutMillis(), e.code);
+                        latency, e.code);
                 lastError = e.code + " on " + gw + ": " + e.getMessage();
                 onAttemptFailure(txnId, gw, lastError, attemptNo);
             } catch (ExecutionException ee) {
                 // A gateway failure thrown inside the worker thread arrives wrapped.
                 Throwable cause = ee.getCause();
+                long latency = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
                 if (cause instanceof GatewayClient.GatewayException ge) {
                     boolean timeout = ge instanceof GatewayClient.GatewayTimeout;
-                    routing.recordResult(gw, false, props.attemptTimeoutMillis());
+                    routing.recordResult(gw, false, latency);
                     recordAttempt(txnId, gw, attemptNo,
-                            timeout ? AttemptOutcome.TIMEOUT : AttemptOutcome.DECLINED,
-                            props.attemptTimeoutMillis(), ge.code);
+                            timeout ? AttemptOutcome.TIMEOUT : AttemptOutcome.DECLINED, latency, ge.code);
                     lastError = ge.code + " on " + gw + ": " + ge.getMessage();
                     onAttemptFailure(txnId, gw, lastError, attemptNo);
                 } else {
-                    routing.recordResult(gw, false, props.attemptTimeoutMillis());
-                    recordAttempt(txnId, gw, attemptNo, AttemptOutcome.DECLINED,
-                            props.attemptTimeoutMillis(), "INTERNAL_ERROR");
+                    routing.recordResult(gw, false, latency);
+                    recordAttempt(txnId, gw, attemptNo, AttemptOutcome.DECLINED, latency, "INTERNAL_ERROR");
                     lastError = "internal error on " + gw + ": " + cause;
                     onAttemptFailure(txnId, gw, lastError, attemptNo);
                 }
             } catch (InterruptedException ie) {
+                routing.recordResult(gw, false,
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                 Thread.currentThread().interrupt();
                 lastError = "interrupted while calling " + gw;
                 onAttemptFailure(txnId, gw, lastError, attemptNo);
@@ -279,6 +301,7 @@ public class PaymentService {
             states.mutate(txnId, x -> x.setCapturedPaise(captured));
             states.applyTransition(txnId, target, "gateway:" + gw,
                     "captured=" + captured + " latencyMs=" + latency);
+            routing.recordCaptureSuccess(gw);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             String code = cause instanceof GatewayClient.GatewayException ge ? ge.code : "CAPTURE_ERROR";

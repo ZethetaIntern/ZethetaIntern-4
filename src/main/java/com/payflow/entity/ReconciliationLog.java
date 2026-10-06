@@ -11,17 +11,17 @@ import java.util.UUID;
         @Index(name = "idx_recon_txn", columnList = "transactionId")})
 public class ReconciliationLog {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 64)
     private String runId;
 
-    @Column(name = "transaction_id", updatable = false)
+    @Column(name = "transaction_id", updatable = false, length = 36)
     private String transactionId;
 
     /** e.g. LATE_SUCCESS, MISSING_WEBHOOK, GATEWAY_STATE_MISMATCH */
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 64)
     private String discrepancyType;
 
     @Column(columnDefinition = "TEXT", updatable = false)

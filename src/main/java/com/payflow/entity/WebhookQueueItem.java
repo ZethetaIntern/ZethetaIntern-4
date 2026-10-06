@@ -16,13 +16,13 @@ public class WebhookQueueItem {
     public enum Status { PENDING, PROCESSING, COMPLETED, FAILED, DLQ }
 
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String gateway;
 
-    @Column(name = "event_id", nullable = false, updatable = false)
+    @Column(name = "event_id", nullable = false, updatable = false, length = 255)
     private String eventId;
 
     @Column(nullable = false, updatable = false, columnDefinition = "TEXT")
@@ -32,7 +32,7 @@ public class WebhookQueueItem {
     private String signature;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 16)
     private Status status = Status.PENDING;
 
     @Column(name = "retry_count", nullable = false)

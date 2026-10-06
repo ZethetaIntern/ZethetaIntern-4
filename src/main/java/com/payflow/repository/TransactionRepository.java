@@ -7,6 +7,9 @@ import jakarta.persistence.QueryHint;
 import org.springframework.data.jpa.repository.*;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -29,6 +32,9 @@ public interface TransactionRepository extends JpaRepository<Transaction, String
     Optional<Transaction> findFirstByStateOrderByUpdatedAtAsc(TransactionState state);
 
     List<Transaction> findByStateIn(List<TransactionState> states);
+
+    Page<Transaction> findByGatewayAndStateInAndUpdatedAtAfterOrderByUpdatedAtDesc(
+            String gateway, List<TransactionState> states, Instant updatedAfter, Pageable pageable);
 
     Optional<Transaction> findFirstByStateAndGatewayIsNotNull(TransactionState state);
 }

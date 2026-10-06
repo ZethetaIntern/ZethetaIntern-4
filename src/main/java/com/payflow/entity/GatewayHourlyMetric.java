@@ -14,10 +14,10 @@ import java.time.Instant;
 public class GatewayHourlyMetric {
 
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String id;
 
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 32)
     private String gateway;
 
     @Column(nullable = false, updatable = false)
@@ -26,7 +26,7 @@ public class GatewayHourlyMetric {
     @Column(nullable = false)
     private double successRate;
 
-    @Column(nullable = false)
+    @Column(name = "p95_latency_ms", nullable = false)
     private int p95LatencyMs;
 
     @Column(nullable = false)

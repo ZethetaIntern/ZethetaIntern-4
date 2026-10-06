@@ -71,10 +71,21 @@ for each gateway in ranked:
 exhausted -> FAILED_TERMINAL
 ```
 
-Each attempt is bounded by `PAYFLOW_ATTEMPT_TIMEOUT_MS` (default 2000ms), so a
-single unresponsive gateway can never consume more than the failover budget.
-Observed wall-clock for a one-gateway timeout + successful failover in FS-01:
-**< 2s total**.
+The whole authorization and failover loop shares one deadline,
+`PAYFLOW_FAILOVER_TIMEOUT_MS` (default 2000ms). Each gateway call is bounded by
+the smaller of the remaining time and `PAYFLOW_ATTEMPT_TIMEOUT_MS`; local
+rate-limit admission is non-blocking so it cannot extend that deadline. FS-01
+uses a delayed primary timeout before succeeding on the alternate gateway and
+asserts the complete flow stays **under 2s**.
+
+Success rate is based on transactions reaching `CAPTURED` or `SETTLED` versus
+authorization attempts in the preceding 15 minutes. P95 latency uses persisted
+authorization-attempt timings from the same window (up to 1,000 observations
+per gateway). At cold start, the router uses
+the seeded 24-hour hourly history, then the configured baseline if no historical
+rows exist. A half-open gateway is limited to one in-flight recovery probe;
+when it ranks first, a healthy runner-up is preferred unless the recovering
+gateway's score advantage exceeds 20%.
 
 ## Worked example (₹2,500 card, cold start)
 

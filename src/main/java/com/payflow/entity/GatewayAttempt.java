@@ -6,23 +6,25 @@ import java.time.Instant;
 import java.util.UUID;
 
 @Entity
-@Table(name = "gateway_attempts", indexes = @Index(name = "idx_att_txn", columnList = "transactionId"))
+@Table(name = "gateway_attempts", indexes = {
+        @Index(name = "idx_att_txn", columnList = "transactionId"),
+        @Index(name = "idx_att_gateway_time", columnList = "gateway,createdAt")})
 public class GatewayAttempt {
     @Id
-    @Column(nullable = false, updatable = false)
+    @Column(nullable = false, updatable = false, length = 36)
     private String id = UUID.randomUUID().toString();
 
-    @Column(name = "transaction_id", nullable = false)
+    @Column(name = "transaction_id", nullable = false, length = 36)
     private String transactionId;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 32)
     private String gateway;
 
     @Column(nullable = false)
     private int attemptNo;
 
     @Enumerated(EnumType.STRING)
-    @Column(nullable = false)
+    @Column(nullable = false, length = 16)
     private AttemptOutcome outcome;
 
     private long latencyMs;

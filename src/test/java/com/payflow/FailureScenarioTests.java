@@ -44,6 +44,8 @@ class FailureScenarioTests {
     static class StubGatewayClient implements GatewayClient {
         static final AtomicReference<Mode> authMode = new AtomicReference<>(Mode.OK);
         static final AtomicReference<Mode> captureMode = new AtomicReference<>(Mode.OK);
+        static final java.util.concurrent.atomic.AtomicLong failureDelayMs =
+                new java.util.concurrent.atomic.AtomicLong();
 
         /** When set, auth failures apply only to this gateway (null = all gateways). */
         static final AtomicReference<String> failGateway = new AtomicReference<>(null);
@@ -55,6 +57,14 @@ class FailureScenarioTests {
             String only = failGateway.get();
             if (only != null && !only.equals(gateway)) {
                 return new AuthResult(true, reference + ":" + gateway, null, 10);
+            }
+            if (only != null && only.equals(gateway) && failureDelayMs.get() > 0) {
+                try {
+                    Thread.sleep(failureDelayMs.get());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new GatewayTimeout(gateway);
+                }
             }
             switch (authMode.get()) {
                 case TIMEOUT -> throw new GatewayTimeout(gateway);
@@ -114,6 +124,7 @@ class FailureScenarioTests {
         String top = routing.rank("card", 250000).get(0).route().getGateway();
         StubGatewayClient.failGateway.set(top);
         StubGatewayClient.authMode.set(StubGatewayClient.Mode.TIMEOUT);
+        StubGatewayClient.failureDelayMs.set(1100);
         StubGatewayClient.captureMode.set(StubGatewayClient.Mode.OK);
         try {
             long start = System.currentTimeMillis();
@@ -129,6 +140,7 @@ class FailureScenarioTests {
         } finally {
             StubGatewayClient.failGateway.set(null);
             StubGatewayClient.authMode.set(StubGatewayClient.Mode.OK);
+            StubGatewayClient.failureDelayMs.set(0);
             routing.setHealth(top, true);
         }
     }

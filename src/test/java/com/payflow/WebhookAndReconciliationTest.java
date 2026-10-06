@@ -56,6 +56,24 @@ class WebhookAndReconciliationTest {
     }
 
     @Test
+    void concurrentDuplicateDeliveriesReconcileOnlyOnce() throws Exception {
+        var txn = payments.create("wh-concurrent-1", "ORD-WH-CONCURRENT", 50000, "INR", "upi");
+        states(txn.getId());
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var first = pool.submit(() -> postEvent("wh-concurrent-event", "succeeded", txn.getId()));
+            var second = pool.submit(() -> postEvent("wh-concurrent-event", "succeeded", txn.getId()));
+            Result a = first.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            Result b = second.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            assertEquals(1, (a.reconciled() ? 1 : 0) + (b.reconciled() ? 1 : 0));
+            assertEquals(1, (a.deduplicated() ? 1 : 0) + (b.deduplicated() ? 1 : 0));
+            assertEquals(TransactionState.AUTHORISED, payments.getTransaction(txn.getId()).getState());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
     void missingEventIdRejected() {
         Result r = webhooks.ingest("razorpay", signed("{\"x\":1}"), "{\"x\":1}".getBytes(StandardCharsets.UTF_8));
         assertFalse(r.accepted());

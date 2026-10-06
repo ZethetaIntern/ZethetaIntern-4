@@ -3,8 +3,6 @@ package com.payflow.service;
 import com.payflow.entity.IdempotencyKey;
 import com.payflow.repository.IdempotencyKeyRepository;
 import jakarta.persistence.EntityManager;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -30,8 +28,6 @@ import java.util.Optional;
 @Service
 public class IdempotencyService {
 
-    private static final Logger log = LoggerFactory.getLogger(IdempotencyService.class);
-
     public enum Outcome { PROCEED, REPLAY, CONFLICT_IN_PROGRESS }
 
     public record Decision(Outcome outcome, String transactionId, IdempotencyKey.Status status) {}
@@ -55,13 +51,11 @@ public class IdempotencyService {
         if (postgres == null) {
             synchronized (this) {
                 if (postgres == null) {
-                    boolean pg;
                     try (java.sql.Connection c = dataSource.getConnection()) {
-                        pg = c.getMetaData().getDatabaseProductName().toLowerCase().contains("postgres");
-                    } catch (Exception e) {
-                        pg = false;
+                        postgres = c.getMetaData().getDatabaseProductName().toLowerCase().contains("postgres");
+                    } catch (java.sql.SQLException e) {
+                        throw new IllegalStateException("Unable to identify idempotency database", e);
                     }
-                    postgres = pg;
                 }
             }
         }
@@ -73,16 +67,12 @@ public class IdempotencyService {
      * where the unique primary key on {@code (merchant_id, key)} provides the
      * correctness guarantee instead.
      */
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    @Transactional(propagation = Propagation.REQUIRED)
     public void acquireAdvisoryLock(String merchantId, String key) {
         if (!isPostgres()) return;
-        try {
-            entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(hashtext(:lk))")
-                    .setParameter("lk", "idem_" + IdempotencyKey.compositeId(merchantId, key))
-                    .getSingleResult();
-        } catch (Exception e) {
-            log.debug("advisory lock unavailable: {}", e.getMessage());
-        }
+        entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(hashtext(:lk))")
+                .setParameter("lk", "idem_" + IdempotencyKey.compositeId(merchantId, key))
+                .getSingleResult();
     }
 
     public static String requestHash(String merchantOrderId, long amount, String currency, String method) {
