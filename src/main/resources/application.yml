@@ -1,23 +1,52 @@
 spring:
+  application:
+    name: payflow
   datasource:
-    # Default: embedded H2 in PostgreSQL compatibility mode (dev/tests).
-    # Production: run with --spring.profiles.active=postgres (see docker-compose.yml).
-    url: ${PAYFLOW_DB_URL:jdbc:h2:mem:payflow;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1}
-    username: ${PAYFLOW_DB_USER:sa}
-    password: ${PAYFLOW_DB_PASSWORD:}
-    driver-class-name: ${PAYFLOW_DB_DRIVER:org.h2.Driver}
-  jpa:
-    hibernate:
-      ddl-auto: update
-    open-in-view: false
-  h2:
-    console:
-      enabled: true
+    # In docker-compose this points at PgBouncer (transaction pooling); see docker-compose.yml.
+    url: ${PAYFLOW_DB_URL:jdbc:postgresql://localhost:5432/payflow}
+    username: ${PAYFLOW_DB_USER:payflow}
+    password: ${PAYFLOW_DB_PASSWORD:payflow}
+    hikari:
+      maximum-pool-size: ${PAYFLOW_DB_POOL_SIZE:20}
+      minimum-idle: 5
+      # Fail fast instead of queueing behind an exhausted pool (C5.4): 503 after 2 s.
+      connection-timeout: 2000
+      validation-timeout: 1000
+      leak-detection-threshold: 30000
+      data-source-properties:
+        # 0 disables server-side prepared statements, required behind PgBouncer transaction pooling.
+        prepareThreshold: ${PAYFLOW_DB_PREPARE_THRESHOLD:5}
   flyway:
-    enabled: false
+    enabled: true
+    # Migrations take a session-level advisory lock, so they bypass PgBouncer when a direct URL is given.
+    url: ${PAYFLOW_FLYWAY_URL:${spring.datasource.url}}
+    user: ${spring.datasource.username}
+    password: ${spring.datasource.password}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    serialization:
+      write-dates-as-timestamps: false
+  threads:
+    virtual:
+      # Request threads block on gateway calls; virtual threads make that cheap at 100+ req/s.
+      enabled: true
+
+server:
+  port: 8080
+  shutdown: graceful
 
 springdoc:
-  # OpenAPI 3.0.1 (swagger-core supported version) — matches docs/api-specification.yaml
   api-docs:
     path: /v3/api-docs
   swagger-ui:
@@ -25,34 +54,40 @@ springdoc:
 
 payflow:
   api-key: ${PAYFLOW_API_KEY:pk_test_payflow}
-  webhook-secret: ${PAYFLOW_WEBHOOK_SECRET:whsec_test_secret}
-  attempt-timeout-millis: ${PAYFLOW_ATTEMPT_TIMEOUT_MS:2000}
-  failover-timeout-millis: ${PAYFLOW_FAILOVER_TIMEOUT_MS:2000}
-  max-gateway-attempts: ${PAYFLOW_MAX_ATTEMPTS:3}
-  reconciliation-interval-ms: ${PAYFLOW_RECON_INTERVAL_MS:60000}
-
----
-# Production profile: PostgreSQL 15+ (per project brief)
-spring:
-  config:
-    activate:
-      on-profile: postgres
-  datasource:
-    url: ${PAYFLOW_DB_URL:jdbc:postgresql://localhost:5432/payflow}
-    username: ${PAYFLOW_DB_USER:payflow}
-    password: ${PAYFLOW_DB_PASSWORD}
-    driver-class-name: org.postgresql.Driver
-  jpa:
-    hibernate:
-      ddl-auto: validate
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
-  h2:
-    console:
-      enabled: false
-  flyway:
+  orchestration:
+    attempt-timeout-ms: ${PAYFLOW_ATTEMPT_TIMEOUT_MS:1000}
+    failover-window-ms: ${PAYFLOW_FAILOVER_WINDOW_MS:2000}
+    max-gateway-attempts: 3
+    capture-max-retries: 3
+    capture-backoff-ms: ${PAYFLOW_CAPTURE_BACKOFF_MS:1000}
+    payment-max-retries: 3
+    payment-retry-base-ms: 1000
+  upi:
+    collect-window: ${PAYFLOW_UPI_COLLECT_WINDOW:5m}
+  reconciliation:
+    stale-threshold: ${PAYFLOW_RECON_STALE_THRESHOLD:5m}
+    interval-ms: ${PAYFLOW_RECON_INTERVAL_MS:900000}
+    initial-delay-ms: 120000
+    settlement-lookback-days: 7
+    batch-size: 1000
+  webhooks:
+    inline-processing: true
+    stripe-tolerance-sec: 300
+    razorpay-secret: ${PAYFLOW_RAZORPAY_WEBHOOK_SECRET:rzp_whsec_test}
+    stripe-secret: ${PAYFLOW_STRIPE_WEBHOOK_SECRET:whsec_stripe_test}
+    payu-secret: ${PAYFLOW_PAYU_WEBHOOK_SALT:payu_salt_test}
+  mock:
+    enabled: ${PAYFLOW_MOCK_ENABLED:true}
+    simulate-latency: ${PAYFLOW_MOCK_LATENCY:false}
+    random-failures: false
+  jobs:
     enabled: true
-payflow:
-  api-key: ${PAYFLOW_API_KEY}
-  webhook-secret: ${PAYFLOW_WEBHOOK_SECRET}
+    abandon-after: 30m
+  replica:
+    url: ${PAYFLOW_REPLICA_URL:}
+
+logging:
+  level:
+    root: INFO
+    com.payflow: INFO
+    org.hibernate.SQL: WARN
