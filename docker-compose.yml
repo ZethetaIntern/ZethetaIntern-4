@@ -39,6 +39,7 @@ services:
 
   app:
     build: .
+    restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy

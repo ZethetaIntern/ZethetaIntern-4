@@ -1,5 +1,7 @@
 # PayFlow – Payment Orchestration Layer
 
+[![CI](https://github.com/ZethetaIntern/ZethetaIntern-4/actions/workflows/ci.yml/badge.svg)](https://github.com/ZethetaIntern/ZethetaIntern-4/actions/workflows/ci.yml)
+
 A payment orchestration back-end that routes transactions across Razorpay, Stripe, PayU and UPI
 (simulated) by success rate, latency, cost, health and payment-method fit. It fails over within
 2 seconds, keeps every request idempotent, ingests and deduplicates webhooks, reconciles against

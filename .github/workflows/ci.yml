@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build, lint and test (mvn verify)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: mvn verify (Checkstyle, 728 tests on embedded PostgreSQL 15, JaCoCo >= 80%)
+        run: mvn -B verify
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f target/site/jacoco/jacoco.csv ]; then
+            awk -F, 'NR>1{lm+=$8;lc+=$9;bm+=$6;bc+=$7} END{printf "### Coverage\n\n| Metric | Value |\n|---|---|\n| Line | %.1f%% |\n| Branch | %.1f%% |\n", 100*lc/(lc+lm), 100*bc/(bc+bm)}' \
+              target/site/jacoco/jacoco.csv >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports
+            target/site/jacoco
+
+  docker-e2e:
+    name: docker compose up + smoke tests + k6 benchmarks
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    timeout-minutes: 30
+    env:
+      BASE: http://localhost:8080
+      KEY: pk_test_payflow
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start stack and measure time to healthy (B4.1 requires < 60 s)
+        run: |
+          start=$(date +%s)
+          docker compose up -d
+          until curl -fsS "$BASE/api/v1/health" > /tmp/health.json 2>/dev/null; do
+            elapsed=$(( $(date +%s) - start ))
+            if [ "$elapsed" -ge 60 ]; then
+              echo "::error::application not healthy within 60 s"
+              docker compose ps; docker compose logs --tail=200 app
+              exit 1
+            fi
+            sleep 1
+          done
+          elapsed=$(( $(date +%s) - start ))
+          echo "Healthy after ${elapsed}s"
+          cat /tmp/health.json; echo
+          printf "### docker compose up\n\nHealth check answered **200 after %ss** (limit 60 s)\n\n" "$elapsed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke tests (warm-up, failover, idempotency, signed webhook)
+        run: |
+          set -euo pipefail
+          post() { curl -sS -o /tmp/out.json -w '%{http_code}' -X POST "$BASE$1" -H "X-API-Key: $KEY" \
+                   -H 'Content-Type: application/json' "${@:3}" -d "$2"; }
+          # B4.2 warm-up: 10 standard payments must all succeed
+          for i in $(seq 1 10); do
+            code=$(post /api/v1/payments "{\"merchant_order_id\":\"WARM-$i\",\"amount_paise\":120000,\"payment_method\":\"CARD\"}" \
+                   -H "Idempotency-Key: warm-$i-$RANDOM")
+            [ "$code" = "201" ] || { echo "warm-up $i returned $code"; cat /tmp/out.json; exit 1; }
+          done
+          echo "warm-up: 10/10 payments created"
+
+          # FS-01: primary gateway times out, alternate answers
+          primary=$(curl -sS "$BASE/api/v1/routing/preview?payment_method=CARD&amount_paise=120000" -H "X-API-Key: $KEY" \
+                    | jq -r '.ranked[0].gateway')
+          code=$(post /api/v1/payments '{"merchant_order_id":"FS01","amount_paise":120000,"payment_method":"CARD"}' \
+                 -H "Idempotency-Key: fs01-$RANDOM" -H "X-Mock-Response: ${primary}=timeout")
+          used=$(jq -r .gateway /tmp/out.json)
+          echo "FS-01: primary=$primary -> HTTP $code via $used"
+          [ "$code" = "201" ] && [ "$used" != "$primary" ]
+
+          # FS-03 / A4: replay of a completed request returns the cached response
+          key="idem-$RANDOM"
+          post /api/v1/payments '{"merchant_order_id":"IDEM","amount_paise":5000,"payment_method":"UPI"}' -H "Idempotency-Key: $key" >/dev/null
+          first=$(jq -r .id /tmp/out.json)
+          post /api/v1/payments '{"merchant_order_id":"IDEM","amount_paise":5000,"payment_method":"UPI"}' -H "Idempotency-Key: $key" >/dev/null
+          [ "$(jq -r .id /tmp/out.json)" = "$first" ] && echo "idempotent replay: same payment $first"
+
+          # FS-02 / FS-10: signed webhook accepted, duplicate acknowledged, tampered one rejected
+          code=$(post /api/v1/payments '{"merchant_order_id":"WH","amount_paise":50000,"payment_method":"CARD","capture_mode":"MANUAL"}' \
+                 -H "Idempotency-Key: wh-$RANDOM")
+          id=$(jq -r .id /tmp/out.json); gw=$(jq -r .gateway /tmp/out.json); ref=$(jq -r .gateway_reference /tmp/out.json)
+          body="{\"event_id\":\"evt_ci_$RANDOM\",\"status\":\"captured\",\"transaction_id\":\"$id\",\"gateway_reference\":\"$ref\",\"amount\":50000,\"currency\":\"INR\"}"
+          hdrs=$(curl -sS -X POST "$BASE/api/v1/mock/webhooks/$gw/sign" -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d "$body" \
+                 | jq -r 'to_entries[] | "-H\n\(.key): \(.value)"')
+          mapfile -t sig <<< "$hdrs"
+          c1=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/webhooks/$gw" -H 'Content-Type: application/json' "${sig[@]}" -d "$body")
+          c2=$(curl -sS -o /tmp/dup.json -w '%{http_code}' -X POST "$BASE/api/v1/webhooks/$gw" -H 'Content-Type: application/json' "${sig[@]}" -d "$body")
+          c3=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/v1/webhooks/$gw" -H 'Content-Type: application/json' "${sig[@]}" -d "${body/50000/5000000}")
+          echo "webhook: first=$c1 duplicate=$c2 ($(jq -r .status /tmp/dup.json)) tampered=$c3"
+          [ "$c1" = "200" ] && [ "$c2" = "200" ] && [ "$c3" = "401" ]
+          state=$(curl -sS "$BASE/api/v1/payments/$id" -H "X-API-Key: $KEY" | jq -r .state)
+          [ "$state" = "CAPTURED" ] && echo "payment $id is CAPTURED after webhook"
+          echo "Smoke tests: warm-up 10/10, FS-01 failover, idempotent replay, webhook dedup + signature check all passed" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: grafana/setup-k6-action@v1
+
+      - name: k6 benchmarks (100 payments/s for 5 min + webhook, idempotency, failover)
+        run: k6 run --summary-export=k6-summary.json -e BASE_URL="$BASE" performance/k6-benchmarks.js
+
+      - name: Benchmark summary
+        if: always()
+        run: |
+          if [ -f k6-summary.json ]; then
+            {
+              echo "### k6 results (B3)"
+              echo
+              echo "| Metric | p95 | Target |"
+              echo "|---|---|---|"
+              jq -r '.metrics as $m |
+                ["payment_initiation_ms","< 500 ms"], ["webhook_processing_ms","< 200 ms"],
+                ["idempotency_replay_ms","< 10 ms"], ["failover_total_ms","< 3000 ms end to end"] |
+                "| \(.[0]) | \(($m[.[0]]["p(95)"] // 0) | floor) ms | \(.[1]) |"' k6-summary.json
+              echo
+              jq -r '"Payments: \(.metrics.http_reqs.count) HTTP requests, \(.metrics.http_reqs.rate | floor) req/s overall, payment failure rate \((.metrics.payment_failures.value // 0) * 100 | . * 100 | floor / 100)%"' k6-summary.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Database integrity audit (B4.2 phase 5)
+        if: always()
+        run: |
+          q() { docker compose exec -T postgres psql -U payflow -d payflow -tAc "$1"; }
+          echo "transactions: $(q 'SELECT COUNT(*) FROM transactions')"
+          dup=$(q "SELECT COUNT(*) FROM (SELECT merchant_id, idempotency_key FROM transactions GROUP BY 1,2 HAVING COUNT(*) > 1) d")
+          over=$(q "SELECT COUNT(*) FROM transactions WHERE captured_paise + released_paise > amount_paise OR refunded_paise > captured_paise")
+          orphan=$(q "SELECT COUNT(*) FROM transaction_state_log l LEFT JOIN transactions t ON t.id = l.transaction_id WHERE t.id IS NULL")
+          echo "duplicate charges=$dup over-captured/over-refunded=$over orphaned audit rows=$orphan"
+          printf "\n### Data integrity\n\nduplicate charges: %s, amount violations: %s, orphaned audit rows: %s\n" "$dup" "$over" "$orphan" >> "$GITHUB_STEP_SUMMARY"
+          [ "$dup" = "0" ] && [ "$over" = "0" ] && [ "$orphan" = "0" ]
+
+      - name: Upload k6 results and logs
+        if: always()
+        run: docker compose logs --no-color app > app.log 2>&1 || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-and-logs
+          path: |
+            k6-summary.json
+            app.log
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
