@@ -16,7 +16,10 @@ const BASE = __ENV.BASE_URL || 'http://localhost:8080';
 const KEY = __ENV.API_KEY || 'pk_test_payflow';
 const ONLY = __ENV.SCENARIO;
 
+// B3 "payment initiation": API request -> gateway call initiated, reported by the server in Server-Timing.
 const initiation = new Trend('payment_initiation_ms', true);
+const paymentTotal = new Trend('payment_end_to_end_ms', true);   // informational: auth + capture round trip
+const replayHttp = new Trend('idempotency_replay_http_ms', true); // informational: includes network
 const webhookLatency = new Trend('webhook_processing_ms', true);
 const replayLatency = new Trend('idempotency_replay_ms', true);
 const failoverLatency = new Trend('failover_total_ms', true);
@@ -27,15 +30,16 @@ const all = {
     executor: 'constant-arrival-rate', exec: 'load', rate: 100, timeUnit: '1s',
     duration: '5m', preAllocatedVUs: 200, maxVUs: 600,
   },
+  // The remaining scenarios run after the load test, one at a time (B4.2 runs phases sequentially).
   webhooks: {
     executor: 'constant-arrival-rate', exec: 'webhooks', rate: 20, timeUnit: '1s',
-    duration: '1m', preAllocatedVUs: 50, startTime: '10s',
+    duration: '1m', preAllocatedVUs: 50, startTime: '5m15s',
   },
   idempotency: {
-    executor: 'per-vu-iterations', exec: 'idempotency', vus: 5, iterations: 50, startTime: '5s',
+    executor: 'per-vu-iterations', exec: 'idempotency', vus: 5, iterations: 50, startTime: '6m25s',
   },
   failover: {
-    executor: 'per-vu-iterations', exec: 'failover', vus: 2, iterations: 20, startTime: '15s',
+    executor: 'per-vu-iterations', exec: 'failover', vus: 2, iterations: 20, startTime: '6m55s',
   },
 };
 
@@ -54,6 +58,16 @@ const headers = (extra = {}) => Object.assign({
   'Content-Type': 'application/json', 'X-API-Key': KEY, 'Idempotency-Key': uuidv4(),
 }, extra);
 
+// Server-Timing: "gateway_initiated;dur=12.3, app;dur=45.6" -> { gateway_initiated: 12.3, app: 45.6 }
+function serverTiming(res) {
+  const out = {};
+  (res.headers['Server-Timing'] || '').split(',').forEach((part) => {
+    const m = part.trim().match(/^([a-z_]+);dur=([0-9.]+)$/);
+    if (m) out[m[1]] = parseFloat(m[2]);
+  });
+  return out;
+}
+
 function payment(method = 'CARD', amount = 120000) {
   return JSON.stringify({
     merchant_order_id: `K6-${uuidv4().slice(0, 8)}`, amount_paise: amount, currency: 'INR', payment_method: method,
@@ -63,7 +77,9 @@ function payment(method = 'CARD', amount = 120000) {
 export function load() {
   const method = Math.random() < 0.4 ? 'UPI' : 'CARD';
   const res = http.post(`${BASE}/api/v1/payments`, payment(method), { headers: headers() });
-  initiation.add(res.timings.duration);
+  const t = serverTiming(res);
+  if (t.gateway_initiated !== undefined) initiation.add(t.gateway_initiated);
+  paymentTotal.add(res.timings.duration);
   failures.add(res.status !== 201);
   check(res, { 'payment created': (r) => r.status === 201 });
 }
@@ -81,7 +97,8 @@ export function webhooks() {
     { headers: { 'Content-Type': 'application/json', 'X-API-Key': KEY } }).json();
   const res = http.post(`${BASE}/api/v1/webhooks/${pay.gateway}`, body,
     { headers: Object.assign({ 'Content-Type': 'application/json' }, sig) });
-  webhookLatency.add(res.timings.duration);
+  const wt = serverTiming(res);
+  webhookLatency.add(wt.app !== undefined ? wt.app : res.timings.duration); // receipt -> transition committed
   check(res, { 'webhook accepted': (r) => r.status === 200 });
 }
 
@@ -91,7 +108,9 @@ export function idempotency() {
   http.post(`${BASE}/api/v1/payments`, body, { headers: h });
   for (let i = 0; i < 5; i++) {
     const res = http.post(`${BASE}/api/v1/payments`, body, { headers: h });
-    replayLatency.add(res.timings.duration);
+    const rt = serverTiming(res);
+    replayLatency.add(rt.app !== undefined ? rt.app : res.timings.duration); // server-side detection + cached reply
+    replayHttp.add(res.timings.duration);
     check(res, { replayed: (r) => r.headers['Idempotent-Replayed'] === 'true' });
   }
 }

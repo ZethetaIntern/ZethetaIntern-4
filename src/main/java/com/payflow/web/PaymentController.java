@@ -164,8 +164,10 @@ public class PaymentController {
     }
 
     static ResponseEntity<Map<String, Object>> respond(PaymentService.ApiResult r) {
-        return ResponseEntity.status(r.status())
-                .header("Idempotent-Replayed", String.valueOf(r.replayed()))
-                .body(r.body());
+        ResponseEntity.BodyBuilder b = ResponseEntity.status(r.status())
+                .header("Idempotent-Replayed", String.valueOf(r.replayed()));
+        String timing = com.payflow.tracing.RequestTiming.serverTimingHeader();
+        if (timing != null) b.header("Server-Timing", timing); // B3: time to gateway call initiated
+        return b.body(r.body());
     }
 }

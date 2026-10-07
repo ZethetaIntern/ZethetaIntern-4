@@ -24,6 +24,7 @@ public class TraceFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
+        RequestTiming.start();
         String traceId = validUuid(request.getHeader(TraceContext.TRACE_HEADER));
         String requestId = "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         MDC.put(TraceContext.TRACE_ID, traceId);
@@ -36,6 +37,7 @@ public class TraceFilter extends OncePerRequestFilter {
         try {
             chain.doFilter(request, response);
         } finally {
+            RequestTiming.clear();
             MDC.clear();
         }
     }

@@ -25,6 +25,7 @@ import com.payflow.routing.GatewayConfigService;
 import com.payflow.routing.GatewayRouter;
 import com.payflow.statemachine.Audit;
 import com.payflow.statemachine.TransactionStateMachine;
+import com.payflow.tracing.RequestTiming;
 import com.payflow.tracing.TraceContext;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -195,6 +196,7 @@ public class AuthorisationOrchestrator {
             long remaining = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
             long budget = Math.min(attemptTimeout, remaining);
             long started = System.nanoTime();
+            RequestTiming.markGatewayCallInitiated();
             try {
                 PaymentGateway.AuthResponse response = caller.call(gw, budget, () -> gateway.authorize(request));
                 recorder.success(t, gw, GatewayAttempt.Operation.AUTH, attemptNo,

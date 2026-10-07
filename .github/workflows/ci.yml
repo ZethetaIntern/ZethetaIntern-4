@@ -137,6 +137,11 @@ jobs:
         if: always()
         run: |
           if [ -f k6-summary.json ]; then
+            # Also as a public annotation (readable without signing in)
+            note=$(jq -r '.metrics | to_entries | map(select(.key | test("_ms$|payment_failures|http_reqs"))) |
+                     map(.key + ": " + ((.value["p(95)"] // .value.value // .value.rate // .value.count) | tostring)) | join(" | ")' k6-summary.json)
+            echo "::notice title=k6 p95 results::${note}"
+
             {
               echo "### k6 results (B3)"
               echo

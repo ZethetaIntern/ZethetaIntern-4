@@ -36,6 +36,7 @@ class ApiEndpointsIntegrationTest extends IntegrationTest {
         assertThat(p).containsEntry("state", "CAPTURED").containsEntry("amount_paise", 120_000)
                 .containsEntry("amount", "1200.00").containsEntry("currency", "INR").containsKeys("id", "trace_id", "gateway");
         assertThat(r.getResponse().getHeader("X-Trace-Id")).isNotBlank();
+        assertThat(r.getResponse().getHeader("Server-Timing")).matches("gateway_initiated;dur=[0-9.]+, app;dur=[0-9.]+");
     }
 
     @Test

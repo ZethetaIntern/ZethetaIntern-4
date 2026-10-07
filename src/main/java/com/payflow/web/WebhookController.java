@@ -74,7 +74,10 @@ public class WebhookController {
     private ResponseEntity<Map<String, Object>> handle(String gateway, byte[] body, HttpServletRequest request) {
         WebhookIngestionService.IngestResult r = ingestion.ingest(gateway, lowerCaseHeaders(request), body,
                 TraceFilter.clientIp(request), request.getHeader("User-Agent"), request.getRequestURI());
-        return ResponseEntity.status(r.status()).body(r.body());
+        ResponseEntity.BodyBuilder b = ResponseEntity.status(r.status());
+        String timing = com.payflow.tracing.RequestTiming.serverTimingHeader();
+        if (timing != null) b.header("Server-Timing", timing); // B3: receipt to state transition committed
+        return b.body(r.body());
     }
 
     static Map<String, String> lowerCaseHeaders(HttpServletRequest request) {
