@@ -1,0 +1,19 @@
+payflow:
+  orchestration:
+    attempt-timeout-ms: 600
+    failover-window-ms: 1200
+    capture-backoff-ms: 20
+    payment-retry-base-ms: 50
+  jobs:
+    enabled: false
+  mock:
+    simulate-latency: false
+  reconciliation:
+    initial-delay-ms: 3600000
+
+logging:
+  level:
+    root: WARN
+    com.payflow: WARN
+    SECURITY: ERROR
+    ALERT: OFF
