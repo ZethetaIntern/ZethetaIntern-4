@@ -1,119 +1,190 @@
-# PayFlow — Payment Orchestration Layer (Java 21 / Spring Boot / PostgreSQL 15+)
+# PayFlow – Payment Orchestration Layer
 
-Payment orchestration back-end with simulated gateway adapters for **Razorpay,
-Stripe, PayU and UPI**, intelligent routing, a 2-second end-to-end authorization
-failover budget, idempotency, two-phase authorise/capture lifecycle, webhook
-reconciliation with deduplication, and an audit trail.
+A payment orchestration back-end that routes transactions across Razorpay, Stripe, PayU and UPI
+(simulated) by success rate, latency, cost, health and payment-method fit. It fails over within
+2 seconds, keeps every request idempotent, ingests and deduplicates webhooks, reconciles against
+gateway status and settlement data, and records every state change in an immutable audit trail.
 
-Implements the *Payment Orchestration Layer* brief end to end:
+Java 21 · Spring Boot 3.3 · PostgreSQL 15 · Flyway · Docker Compose.
 
-| Brief section | Implementation |
-|---|---|
-| A3 Routing algorithm | `core/RoutingEngine` — weighted score (15-minute success/P95 latency, cost, health, method fit), historical cold-start data, circuit breaker |
-| A3.3 Weights in DB | `routing_config` table + `GET/PUT /routing/weights` (tunable without redeploy) |
-| A4/A5 State machine | `domain/TransactionState` + `service/StateService` — 18 states, validated transitions, immutable `transaction_state_log` |
-| A4.2 Locking | Pessimistic lock around transitions only, `@Version` optimistic locking, no locks during gateway I/O |
-| A5 Webhook pipeline | `service/WebhookService` — constant-time HMAC (SHA-256/512), per-event database lock and `(gateway,event_id)` dedup, reconciliation onto the FSM |
-| A5.5 Reconciliation | `service/ReconciliationService` — scheduled batch flagging stuck intermediate states |
-| A6 Database | PostgreSQL 15+ Flyway migration: `src/main/resources/db/migration/V1__initial_schema.sql` |
-| A7 API | 23 API operations, OpenAPI 3.0.1 at `docs/api-specification.yaml` + live docs `/swagger-ui.html`, `/v3/api-docs` |
-| Part B FS-01..FS-15 | All 15 failure scenarios covered in `src/test/java/com/payflow/FailureScenarioTests.java` |
-| Part D Quality | JaCoCo line coverage gate (80%), coverage report (`target/site/jacoco`), Docker + docker-compose |
-
-## Run
+## Quick start
 
 ```bash
-# Tests (H2 in PostgreSQL-compat mode; no external DB required)
-mvnw.cmd test          # Windows  (mvn test elsewhere)
-# Coverage report: target/site/jacoco/index.html; Maven verify enforces 80% line coverage
-
-# App with embedded H2
-mvnw.cmd spring-boot:run
-
-# Local/demo stack: PostgreSQL 15 + simulated gateway adapters
-docker compose up --build          # app :8080, postgres :5432
+docker compose up --build
 ```
 
-Live API docs: http://localhost:8080/swagger-ui.html
+- API: `http://localhost:8080`
+- Health: `GET http://localhost:8080/api/v1/health` (public)
+- Swagger UI: `http://localhost:8080/swagger-ui.html`, OpenAPI JSON at `/v3/api-docs`
+  (exported to `docs/api-specification.yaml`)
+- Every `/api/v1/**` call except health and webhooks needs `X-API-Key: pk_test_payflow`
 
-The gateway clients are deterministic simulators for the project failure
-scenarios; this repository does not contain live Razorpay, Stripe, PayU, or NPCI
-connectors. The PostgreSQL profile requires explicit `PAYFLOW_API_KEY`,
-`PAYFLOW_WEBHOOK_SECRET`, and `PAYFLOW_DB_PASSWORD` values. The credentials in
-`docker-compose.yml` are local demo values only and must not be used in a
-deployed environment. Production schema changes run through Flyway; Hibernate
-is set to validate the resulting schema.
+### Without Docker
 
-## Failure scenarios (Part B) — all passing
+Requires JDK 21 and PostgreSQL 15. Make sure `JAVA_HOME` points to JDK 21 (a JDK 17 `JAVA_HOME`
+makes Maven's test JVM fail with `UnsupportedClassVersionError`).
 
-| ID | Scenario | Asserted behaviour |
+```bash
+createdb payflow
+export PAYFLOW_DB_URL=jdbc:postgresql://localhost:5432/payflow PAYFLOW_DB_USER=payflow PAYFLOW_DB_PASSWORD=payflow
+mvn spring-boot:run
+```
+
+Flyway creates the schema and seeds gateways, routing weights, circuit-breaker defaults and the
+A3.4 historical dataset on start-up.
+
+### Tests
+
+```bash
+mvn verify
+```
+
+Runs 728 tests against an embedded PostgreSQL 15 (zonky embedded-postgres; no Docker needed) and
+enforces ≥80% line coverage (current: 89.4%). The 15 failure scenarios are in
+`src/test/java/com/payflow/FailureScenarioTest.java`.
+
+## Examples
+
+```bash
+H='-H X-API-Key:pk_test_payflow -H Content-Type:application/json'
+
+# Create a payment (amounts are integer paise: ₹1,200.00 = 120000)
+curl -s $H -H "Idempotency-Key: $(uuidgen)" localhost:8080/api/v1/payments \
+  -d '{"merchant_order_id":"ORD-1001","amount_paise":120000,"currency":"INR","payment_method":"CARD","capture_mode":"MANUAL"}'
+
+# Capture ₹800 of the ₹1,200 hold (FS-05), then release the rest
+curl -s $H localhost:8080/api/v1/payments/<id>/capture -d '{"amount_paise":80000}'
+curl -s $H -X POST localhost:8080/api/v1/payments/<id>/void
+
+# Refund
+curl -s $H localhost:8080/api/v1/payments/<id>/refund -d '{"amount_paise":20000,"reason":"returned"}'
+
+# Make Razorpay time out so the payment fails over (FS-01)
+curl -s $H -H "Idempotency-Key: $(uuidgen)" -H "X-Mock-Response: razorpay=timeout" \
+  localhost:8080/api/v1/payments -d '{"merchant_order_id":"ORD-1002","amount_paise":50000,"payment_method":"CARD"}'
+
+# Sign a webhook body the way a gateway would, then deliver it
+BODY='{"event_id":"evt_1","status":"captured","gateway_reference":"pay_xxx","amount":120000,"currency":"INR"}'
+curl -s $H localhost:8080/api/v1/mock/webhooks/razorpay/sign -d "$BODY"   # -> {"X-Razorpay-Signature":"..."}
+curl -s -H "X-Razorpay-Signature: <sig>" localhost:8080/api/v1/webhooks/razorpay -d "$BODY"
+```
+
+Request bodies use snake_case (camelCase aliases are accepted). `X-Merchant-Id` (default
+`default`) scopes payments and idempotency keys per merchant.
+
+## Mock gateway control headers (B4.3)
+
+| Header | Values | Effect |
 |---|---|---|
-| FS-01 | Delayed auth timeout | A delayed primary timeout followed by alternate-gateway success stays within 2s |
-| FS-02 | Duplicate webhook ×3 | Processed once; duplicates deduplicated |
-| FS-03 | Double submit | Second request resolves to the original transaction |
-| FS-04 | 5xx on capture | `CAPTURE_FAILED` + audit entry |
-| FS-05 | Partial capture | `PARTIALLY_CAPTURED`, captured amount vs hold tracked |
-| FS-06 | Webhook before API response | Unknown outcome reconciled to `AUTHORISED` |
-| FS-07 | Cascade failure | Circuit breaker opens, gateway excluded from ranking |
-| FS-08 | Refund on settled txn | `REFUNDED`, refund records persisted |
-| FS-09 | Concurrent idempotency race | Exactly one transaction; loser replays |
-| FS-10 | Webhook replay attack | Tampered body rejected (401) |
-| FS-11 | Missing settlement | Reconciliation flags the stuck transaction |
-| FS-12 | UPI collect timeout | `failed` webhook reconciles to `AUTH_FAILED` |
-| FS-13 | Idempotency key collision | Second merchant gets the original transaction |
-| FS-14 | Traffic spike (20 concurrent) | All complete without state corruption |
-| FS-15 | State machine corruption | `CREATED → REFUNDED` rejected, state unchanged |
+| `X-Mock-Response` | `success`, `timeout`, `server-error`, `decline`, `rate-limit`, `pending` | forced outcome |
+| `X-Mock-Delay-Ms` | e.g. `2000` | delay before the response |
+| `X-Mock-Gateway-Down` | `true` or a list `razorpay,payu` | connection refused |
+| `X-Mock-Gateway` (extension) | gateway name | scope bare values to one gateway |
+| `X-Mock-Operation` (extension) | `auth`, `capture`, `refund`, `void`, `status` | scope bare values to one operation |
+| `X-Mock-Retry-After` (extension) | seconds | Retry-After returned with `rate-limit` |
 
+Per-target syntax: `X-Mock-Response: razorpay=timeout, payu.capture=server-error, refund=decline`
+(most specific wins: `gateway.operation`, `gateway`, `operation`, global).
 
-## API quick reference
+Harness helpers (`/api/v1/mock`, disabled with `PAYFLOW_MOCK_ENABLED=false`):
+`POST /gateways/{g}/status` and `/settlement` (`{"reference","status"}`) change what the gateway's
+status API / settlement report says; `GET /gateways/{g}/charges`; `POST /upi/{id}/callback`
+(`{"status":"SUCCESS|FAILURE|EXPIRED"}`) sends a signed NPCI callback; `POST /webhooks/{g}/sign`;
+`POST /reset` clears simulator state.
 
-| Method | Path | Description |
+## Webhook signatures
+
+| Gateway | Endpoint | Header | Scheme | Secret env var |
+|---|---|---|---|---|
+| Razorpay | `/api/v1/webhooks/razorpay` | `X-Razorpay-Signature` | hex HMAC-SHA256 of raw body | `PAYFLOW_RAZORPAY_WEBHOOK_SECRET` (`rzp_whsec_test`) |
+| Stripe | `/api/v1/webhooks/stripe` | `Stripe-Signature: t=..,v1=..` | hex HMAC-SHA256 of `t.body`, 5-min tolerance | `PAYFLOW_STRIPE_WEBHOOK_SECRET` (`whsec_stripe_test`) |
+| PayU | `/api/v1/webhooks/payu` | `X-PayU-Signature` | hex HMAC-SHA512 of raw body | `PAYFLOW_PAYU_WEBHOOK_SALT` (`payu_salt_test`) |
+| UPI | `/api/v1/webhooks/upi` | `X-NPCI-Signature` | base64 SHA256withRSA of raw body | key pair in `src/main/resources/keys/` (**mock only**; production loads NPCI's certificate via `payflow.webhooks.upi-public-key-pem`) |
+
+Native payload formats (Razorpay events, Stripe events, PayU and UPI callbacks) are parsed, as is a
+generic flat format: `{"event_id","status","gateway_reference","transaction_id","amount","currency"}`.
+
+## Endpoints
+
+| # | Method | Path |
 |---|---|---|
-| POST | `/payments` | Create + process end-to-end (`X-API-Key` + `Idempotency-Key` required) |
-| GET | `/payments/{id}` | Transaction + attempts + audit + refunds |
-| GET | `/payments/{id}/audit` | Immutable state-transition log |
-| GET | `/payments/{id}/attempts` | Gateway attempt records |
-| GET | `/payments/order/{merchantOrderId}` | All transactions for an order |
-| POST | `/payments/{id}/capture` | Capture an authorised transaction |
-| POST | `/payments/{id}/refund` | Full/partial refund |
-| GET | `/payments/{id}/refunds` | Refund records |
-| POST | `/webhooks/{gateway}` | Ingest webhook (`X-Payflow-Signature`) |
-| GET | `/routing/preview?paymentMethod=&amount=` | Live gateway ranking |
-| GET/PUT | `/routing/weights` | Read/update routing weights (no redeploy) |
-| GET | `/admin/gateways` | Gateway configs + health metrics |
-| POST | `/admin/gateways/{gw}/health` | Force health / failover drills |
-| POST | `/admin/reconciliation/run` | Trigger reconciliation batch |
-| GET | `/admin/reconciliation` | Reconciliation discrepancy log |
+| 1 | POST | `/api/v1/payments` |
+| 2 | GET | `/api/v1/payments/{id}` |
+| 3 | GET | `/api/v1/payments?merchant_order_id=` |
+| 4 | POST | `/api/v1/payments/{id}/capture` |
+| 5 | POST | `/api/v1/payments/{id}/void` |
+| 6 | POST | `/api/v1/payments/{id}/refund` |
+| 7 | GET | `/api/v1/payments/{id}/refunds` |
+| 8 | GET | `/api/v1/payments/{id}/timeline` |
+| 9–12 | POST | `/api/v1/webhooks/{razorpay,stripe,payu,upi}` |
+| 13 | GET | `/api/v1/gateways` |
+| 14 | GET | `/api/v1/gateways/{name}/health` |
+| 15 | GET | `/api/v1/gateways/{name}/metrics` |
+| 16 | PUT | `/api/v1/gateways/{name}/config` |
+| 17 | GET | `/api/v1/routing/config` |
+| 18 | PUT | `/api/v1/routing/config` |
+| 19 | POST | `/api/v1/reconciliation/trigger` |
+| 20 | GET | `/api/v1/reconciliation/reports/{run_id}` |
+| 21 | GET | `/api/v1/analytics/success-rate` |
+| 22 | GET | `/api/v1/analytics/volume` |
+| 23 | GET | `/api/v1/health` |
 
-Local/demo headers: `X-API-Key: pk_test_payflow`. Webhook signature:
-HMAC-SHA256 (SHA-512 for PayU) of the raw body with `whsec_test_secret`.
+Extras: `GET /payments/{id}/routing`, `GET /payments/{id}/attempts`, `GET /gateways/{name}/config`,
+`GET /routing/preview`, `/admin/webhooks/dlq` (+ `/{id}/replay`), `/admin/rate-limits`,
+`/admin/circuits` (+ `/{gw}/{method}/open|reset`), `/admin/anomalies`, `/admin/security-events`,
+`/admin/alerts`, `/admin/db-pool`, `/admin/notifications`, and the `/mock` helpers above.
 
-## Architecture
-
-See `docs/architecture.md` and `docs/routing-algorithm.md`.
-
-```
-POST /payments ─▶ IdempotencyKey store ─▶ RoutingEngine (DB weights + health)
-                    │                          │ ranked gateways
-                    ▼                          ▼
-              Transaction ◀── StateService ◀─ failover loop (shared 2s deadline)
-              (pessimistic lock                 │ Shared 2s authorization deadline
-               on transitions only)             ▼
-                                         authorize ─▶ capture (two-phase)
-POST /webhooks/{gw} ─▶ HMAC verify ─▶ dedup PK(gateway,event_id) ─▶ reconcile
-                                                              onto state machine
-@Scheduled reconciliation ─▶ flags stuck intermediate states
-```
+Errors always use the A7.2 format:
+`{"error":{"code","message","details","request_id","trace_id","timestamp"}}`.
 
 ## Configuration
 
-| Env var | Default | Purpose |
+| Env var | Default | Meaning |
 |---|---|---|
-| `PAYFLOW_API_KEY` | `pk_test_payflow` | API auth |
-| `PAYFLOW_WEBHOOK_SECRET` | `whsec_test_secret` | Webhook HMAC secret |
-| `PAYFLOW_ATTEMPT_TIMEOUT_MS` | `2000` | Maximum wait for one gateway response |
-| `PAYFLOW_FAILOVER_TIMEOUT_MS` | `2000` | End-to-end authorization/failover deadline |
-| `PAYFLOW_MAX_ATTEMPTS` | `3` | Max gateways tried per transaction |
-| `PAYFLOW_DB_URL` | H2 in-mem (PostgreSQL mode) | PostgreSQL JDBC URL when using the `postgres` profile |
-| `PAYFLOW_API_KEY` / `PAYFLOW_WEBHOOK_SECRET` | Test-only defaults | Required in the `postgres` profile |
-| `PAYFLOW_DB_PASSWORD` | Empty for H2 | Required in the `postgres` profile |
+| `PAYFLOW_DB_URL` / `_USER` / `_PASSWORD` | `jdbc:postgresql://localhost:5432/payflow`, `payflow`, `payflow` | primary database (PgBouncer in compose) |
+| `PAYFLOW_FLYWAY_URL` | = DB URL | direct PostgreSQL URL for migrations |
+| `PAYFLOW_DB_POOL_SIZE` | 20 | Hikari pool size |
+| `PAYFLOW_DB_PREPARE_THRESHOLD` | 5 | set 0 behind PgBouncer transaction pooling |
+| `PAYFLOW_REPLICA_URL` | empty | optional read replica for read-only work |
+| `PAYFLOW_API_KEY` | `pk_test_payflow` | API key |
+| `PAYFLOW_ATTEMPT_TIMEOUT_MS` | 1000 | per-gateway authorisation budget |
+| `PAYFLOW_FAILOVER_WINDOW_MS` | 2000 | failover window after the first attempt |
+| `PAYFLOW_CAPTURE_BACKOFF_MS` | 1000 | capture retry backoff base (1 s, 2 s, 4 s) |
+| `PAYFLOW_UPI_COLLECT_WINDOW` | 5m | UPI collect mandate window |
+| `PAYFLOW_RECON_STALE_THRESHOLD` | 5m | reconciliation stale threshold |
+| `PAYFLOW_RECON_INTERVAL_MS` | 900000 | reconciliation interval |
+| `PAYFLOW_*_WEBHOOK_*` | test secrets | see table above |
+| `PAYFLOW_MOCK_ENABLED` | true | expose `/api/v1/mock` |
+| `PAYFLOW_MOCK_LATENCY` | false | simulate A3.4 latencies |
+
+Routing weights, circuit-breaker thresholds and gateway capabilities are stored in the database and
+changed through the API, not environment variables.
+
+## Project structure
+
+```
+src/main/java/com/payflow
+  domain/ entity/ repository/   model, 19 tables
+  statemachine/                 TransactionStateMachine, audit writer
+  payment/                      orchestration, capture, refund, API facade
+  routing/ ratelimit/           router, circuit breaker, metrics, rate limiter
+  gateway/                      PaymentGateway + 4 simulated adapters, mock control
+  webhook/ reconciliation/      pipeline and reconciliation engine
+  idempotency/ jobs/ db/ tracing/ security/ alert/ notification/ web/ error/ config/
+src/main/resources/db/migration V1 schema, V2 seed data
+performance/k6-benchmarks.js    load test
+docs/                           see below
+```
+
+## Documentation
+
+- [Architecture](docs/architecture.md) – components, flows, FS-01..FS-15 mapping, case studies
+- [State machine](docs/state-machine.md) – states, transitions, Mermaid diagram, audit trail
+- [Routing algorithm](docs/routing-algorithm.md)
+- [Deliberate errors in the brief](docs/errors-found.md)
+- [ADRs](docs/adr/) – language, gateway simulation, locking/idempotency, webhook pipeline, failover budgets
+- [API specification](docs/api-specification.yaml) (OpenAPI 3.0)
+- [Database schema (DBML)](docs/schema.dbml)
+- [Test coverage report](docs/coverage-report.md)
+- [Performance](docs/performance.md)
+- [Changelog](CHANGELOG.md)

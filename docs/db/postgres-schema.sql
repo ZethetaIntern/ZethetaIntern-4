@@ -1,4 +1,1 @@
--- The authoritative PostgreSQL schema is maintained as a versioned Flyway
--- migration at src/main/resources/db/migration/V1__initial_schema.sql.
--- Apply it with the postgres Spring profile; do not use Hibernate DDL update
--- against production databases.
+-- Superseded. The schema is defined by the Flyway migrations in src/main/resources/db/migration (see docs/schema.dbml).

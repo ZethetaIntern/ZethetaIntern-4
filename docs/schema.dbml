@@ -1,0 +1,322 @@
+// PayFlow schema (PostgreSQL 15) — source: src/main/resources/db/migration/V1__core_schema.sql
+// Paste into https://dbdiagram.io. Money columns are BIGINT paise.
+
+Table transactions {
+  id uuid [pk]
+  merchant_id varchar(64) [not null]
+  idempotency_key varchar(255) [not null]
+  merchant_order_id varchar(255) [not null]
+  amount_paise bigint [not null, note: '> 0']
+  currency varchar(3) [not null]
+  payment_method varchar(20) [not null, note: 'CARD | UPI | NETBANKING | WALLET']
+  capture_mode varchar(16) [not null, default: 'AUTOMATIC']
+  upi_flow varchar(16) [note: 'INTENT | COLLECT']
+  state varchar(32) [not null, note: '22 states, CHECK constrained']
+  version bigint [not null, default: 0]
+  gateway varchar(32)
+  gateway_reference varchar(255)
+  captured_paise bigint [not null, default: 0]
+  released_paise bigint [not null, default: 0]
+  refunded_paise bigint [not null, default: 0]
+  attempts_made int [not null, default: 0]
+  retry_count int [not null, default: 0]
+  next_retry_at timestamptz
+  failure_code varchar(64)
+  failure_reason varchar(512)
+  trace_id uuid [not null]
+  authorised_at timestamptz
+  auth_expires_at timestamptz
+  settled_at timestamptz
+  settlement_batch_id varchar(64)
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+  indexes {
+    (merchant_id, idempotency_key) [unique]
+    merchant_order_id
+    gateway_reference
+    state
+    created_at
+  }
+  Note: 'CHECK captured_paise + released_paise <= amount_paise; CHECK refunded_paise <= captured_paise'
+}
+
+Table transaction_state_log {
+  id uuid [pk]
+  transaction_id uuid [not null, ref: > transactions.id]
+  from_state varchar(32)
+  to_state varchar(32) [not null]
+  event varchar(100) [not null]
+  gateway_reference varchar(255)
+  gateway_response jsonb
+  metadata jsonb
+  created_at timestamptz [not null]
+  created_by varchar(100) [not null]
+  indexes {
+    transaction_id
+    created_at
+    (from_state, to_state)
+  }
+  Note: 'Append-only: trigger rejects UPDATE/DELETE'
+}
+
+Table gateway_routes {
+  id uuid [pk]
+  transaction_id uuid [not null, ref: > transactions.id]
+  attempt_no int [not null]
+  gateway varchar(32) [not null]
+  rank int [not null]
+  score "double precision" [not null]
+  selected boolean [not null]
+  health_status varchar(16) [not null]
+  breakdown jsonb [not null]
+  reason varchar(255)
+  created_at timestamptz [not null]
+  indexes {
+    transaction_id
+    gateway
+    score
+  }
+}
+
+Table idempotency_keys {
+  merchant_id varchar(64) [not null]
+  key varchar(255) [not null]
+  request_hash varchar(64) [not null]
+  request_path varchar(255) [not null]
+  transaction_id uuid
+  status varchar(20) [not null, note: 'PROCESSING | COMPLETED | FAILED']
+  response_code int
+  response_body jsonb
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+  expires_at timestamptz [not null, note: 'now() + 24h']
+  indexes {
+    (merchant_id, key) [pk]
+    expires_at
+  }
+}
+
+Table processed_webhook_events {
+  event_id varchar(255) [not null]
+  gateway varchar(50) [not null]
+  event_type varchar(100) [not null]
+  payload_hash varchar(64) [not null]
+  transaction_id uuid
+  processed_at timestamptz [not null]
+  indexes {
+    (gateway, event_id) [pk]
+    transaction_id
+  }
+}
+
+Table webhook_queue {
+  id bigserial [pk]
+  gateway varchar(50) [not null]
+  event_id varchar(255) [not null]
+  event_type varchar(100) [not null]
+  transaction_id uuid
+  payload jsonb [not null]
+  signature text [not null]
+  source_ip varchar(64)
+  status varchar(20) [not null, note: 'PENDING | PROCESSING | COMPLETED | FAILED | DLQ']
+  retry_count int [not null, default: 0]
+  max_retries int [not null, default: 3]
+  next_retry_at timestamptz
+  error_message text
+  created_at timestamptz [not null]
+  processed_at timestamptz
+  indexes {
+    (gateway, event_id) [unique]
+    next_retry_at
+    status
+  }
+}
+
+Table gateway_config {
+  gateway_name varchar(32) [pk]
+  display_name varchar(64) [not null]
+  enabled boolean [not null]
+  supported_methods varchar(128) [not null]
+  supported_currencies varchar(128) [not null]
+  fee_bps int [not null]
+  fixed_fee_paise bigint [not null]
+  auth_timeout_ms int [not null]
+  rate_limit_per_sec int [not null]
+  rate_limit_strategy varchar(32) [not null]
+  supports_auth_capture boolean [not null]
+  supports_partial_refund boolean [not null]
+  auth_hold_days int [not null]
+  refund_window_days int [not null]
+  settlement_cycle varchar(32) [not null]
+  webhook_signature_scheme varchar(32) [not null]
+  updated_at timestamptz [not null]
+}
+
+Table routing_config {
+  config_key varchar(64) [pk]
+  config_value "numeric(12,4)" [not null]
+  description varchar(255) [not null]
+  updated_at timestamptz [not null]
+  updated_by varchar(100) [not null]
+}
+
+Table circuit_breaker_config {
+  id bigserial [pk]
+  gateway varchar(32) [not null, note: "'*' = any"]
+  payment_method varchar(20) [not null, note: "'*' = any"]
+  failure_threshold int [not null]
+  open_timeout_ms int [not null]
+  half_open_max_requests int [not null]
+  updated_at timestamptz [not null]
+  indexes {
+    (gateway, payment_method) [unique]
+  }
+}
+
+Table circuit_breaker_state {
+  gateway varchar(32) [not null]
+  payment_method varchar(20) [not null]
+  state varchar(16) [not null, note: 'CLOSED | OPEN | HALF_OPEN']
+  consecutive_failures int [not null]
+  half_open_in_flight int [not null]
+  half_open_successes int [not null]
+  opened_at timestamptz
+  last_failure_at timestamptz
+  updated_at timestamptz [not null]
+  version bigint [not null]
+  indexes {
+    (gateway, payment_method) [pk]
+  }
+}
+
+Table gateway_attempts {
+  id uuid [pk]
+  transaction_id uuid [not null, ref: > transactions.id]
+  gateway varchar(32) [not null]
+  payment_method varchar(20) [not null]
+  operation varchar(16) [not null, note: 'AUTH | CAPTURE | REFUND | VOID | STATUS']
+  attempt_no int [not null]
+  outcome varchar(16) [not null]
+  latency_ms bigint [not null]
+  http_status int
+  error_code varchar(64)
+  created_at timestamptz [not null]
+  indexes {
+    transaction_id
+    (gateway, created_at)
+  }
+}
+
+Table gateway_health_metrics {
+  id bigserial [pk]
+  gateway varchar(32) [not null]
+  recorded_at timestamptz [not null]
+  total_count int [not null]
+  success_count int [not null]
+  success_rate "double precision" [not null]
+  p95_latency_ms int [not null]
+  avg_latency_ms int [not null]
+  health_status varchar(16) [not null]
+  indexes {
+    (gateway, recorded_at) [unique]
+  }
+}
+
+Table gateway_historical_performance {
+  gateway varchar(32) [not null]
+  band_start_hour int [not null]
+  band_end_hour int [not null]
+  success_rate "numeric(5,4)" [not null]
+  p95_latency_ms int [not null]
+  transactions int [not null]
+  fee_bps int [not null]
+  fixed_fee_paise bigint [not null]
+  indexes {
+    (gateway, band_start_hour) [pk]
+  }
+  Note: 'A3.4 dataset'
+}
+
+Table refunds {
+  id uuid [pk]
+  transaction_id uuid [not null, ref: > transactions.id]
+  amount_paise bigint [not null]
+  gateway varchar(32) [not null]
+  gateway_refund_id varchar(255)
+  state varchar(20) [not null, note: 'INITIATED | PROCESSED | FAILED']
+  failure_reason varchar(512)
+  created_at timestamptz [not null]
+  updated_at timestamptz [not null]
+  indexes {
+    transaction_id
+    gateway_refund_id
+    state
+  }
+}
+
+Table reconciliation_runs {
+  run_id varchar(64) [pk]
+  trigger varchar(16) [not null]
+  status varchar(16) [not null]
+  started_at timestamptz [not null]
+  finished_at timestamptz
+  duration_ms bigint
+  scanned int [not null]
+  stale int [not null]
+  overridden int [not null]
+  settled int [not null]
+  anomalies int [not null]
+}
+
+Table reconciliation_log {
+  id uuid [pk]
+  run_id varchar(64) [not null, ref: > reconciliation_runs.run_id]
+  transaction_id uuid
+  discrepancy_type varchar(64) [not null]
+  internal_state varchar(32)
+  gateway_status varchar(32)
+  action_taken varchar(64) [not null]
+  detail text
+  created_at timestamptz [not null]
+  indexes {
+    run_id
+    transaction_id
+    discrepancy_type
+  }
+}
+
+Table anomalies {
+  id uuid [pk]
+  run_id varchar(64) [not null]
+  transaction_id uuid [not null, ref: > transactions.id]
+  anomaly_type varchar(64) [not null]
+  internal_state varchar(32) [not null]
+  gateway_status varchar(32) [not null]
+  severity varchar(16) [not null]
+  status varchar(16) [not null]
+  detail text
+  alerted boolean [not null]
+  created_at timestamptz [not null]
+}
+
+Table security_audit_log {
+  id bigserial [pk]
+  event_type varchar(64) [not null]
+  gateway varchar(32)
+  source_ip varchar(64) [not null]
+  user_agent varchar(255)
+  request_path varchar(255) [not null]
+  detail jsonb [not null]
+  created_at timestamptz [not null]
+  Note: 'Append-only: trigger rejects UPDATE/DELETE'
+}
+
+Table notification_outbox {
+  id bigserial [pk]
+  transaction_id uuid [not null, ref: > transactions.id]
+  template varchar(64) [not null]
+  payload jsonb [not null]
+  status varchar(16) [not null]
+  created_at timestamptz [not null]
+  sent_at timestamptz
+}
