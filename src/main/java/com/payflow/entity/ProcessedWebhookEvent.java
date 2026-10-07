@@ -1,43 +1,73 @@
 package com.payflow.entity;
 
-import jakarta.persistence.*;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.IdClass;
+import jakarta.persistence.Table;
+import java.io.Serializable;
 import java.time.Instant;
+import java.util.UUID;
+import org.hibernate.annotations.Immutable;
 
 /**
- * Webhook deduplication store. Composite PK (gateway, event_id) per spec A5.4;
- * insert + reconciliation happen in the same transaction so concurrent
- * deliveries cannot double-process.
+ * Webhook deduplication store (spec A5.4). Composite primary key
+ * {@code (gateway, event_id)}: event ids are only unique within one gateway.
  */
 @Entity
+@Immutable
+@IdClass(ProcessedWebhookEvent.Pk.class)
 @Table(name = "processed_webhook_events")
 public class ProcessedWebhookEvent {
-    @Id
-    @Column(name = "event_key", nullable = false, updatable = false, length = 320)
-    private String eventKey; // gateway + ":" + eventId
 
-    @Column(nullable = false, updatable = false, length = 32)
+    /** Composite primary key (gateway, event_id). */
+    public static class Pk implements Serializable {
+        private String gateway;
+        private String eventId;
+
+        protected Pk() {}
+
+        public Pk(String gateway, String eventId) {
+            this.gateway = gateway;
+            this.eventId = eventId;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Pk p && java.util.Objects.equals(gateway, p.gateway)
+                    && java.util.Objects.equals(eventId, p.eventId);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(gateway, eventId);
+        }
+    }
+
+    @Id
+    @Column(name = "gateway", nullable = false, length = 50)
     private String gateway;
 
-    @Column(nullable = false, updatable = false, length = 255)
+    @Id
+    @Column(name = "event_id", nullable = false)
     private String eventId;
 
-    @Column(nullable = false, updatable = false, length = 100)
+    @Column(name = "event_type", nullable = false, length = 100)
     private String eventType;
 
-    @Column(nullable = false, updatable = false, length = 64)
+    @Column(name = "payload_hash", nullable = false, length = 64)
     private String payloadHash;
 
-    @Column(length = 36)
-    private String transactionId;
+    @Column(name = "transaction_id")
+    private UUID transactionId;
 
-    @Column(nullable = false, updatable = false)
+    @Column(name = "processed_at", nullable = false)
     private Instant processedAt = Instant.now();
 
     protected ProcessedWebhookEvent() {}
 
-    public ProcessedWebhookEvent(String gateway, String eventId, String eventType,
-                                 String payloadHash, String transactionId) {
-        this.eventKey = gateway + ":" + eventId;
+    public ProcessedWebhookEvent(String gateway, String eventId, String eventType, String payloadHash,
+                                 UUID transactionId) {
         this.gateway = gateway;
         this.eventId = eventId;
         this.eventType = eventType;
@@ -45,11 +75,10 @@ public class ProcessedWebhookEvent {
         this.transactionId = transactionId;
     }
 
-    public String getEventKey() { return eventKey; }
     public String getGateway() { return gateway; }
     public String getEventId() { return eventId; }
     public String getEventType() { return eventType; }
     public String getPayloadHash() { return payloadHash; }
-    public String getTransactionId() { return transactionId; }
+    public UUID getTransactionId() { return transactionId; }
     public Instant getProcessedAt() { return processedAt; }
 }
