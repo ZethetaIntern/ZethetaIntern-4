@@ -62,7 +62,15 @@ jobs:
             elapsed=$(( $(date +%s) - start ))
             if [ "$elapsed" -ge 60 ]; then
               echo "::error::application not healthy within 60 s"
-              docker compose ps; docker compose logs --tail=200 app
+              docker compose ps -a
+              docker compose logs --tail=200 app
+              # Publish diagnostics as annotations (readable without signing in to GitHub)
+              for svc in app pgbouncer; do
+                logs=$( { docker compose ps -a "$svc"; docker compose logs --no-color --tail=60 "$svc"; } 2>&1 \
+                        | grep -v '^\s*at ' | tail -c 20000)
+                logs="${logs//'%'/'%25'}"; logs="${logs//$'\r'/}"; logs="${logs//$'\n'/'%0A'}"
+                echo "::error title=${svc} logs::${logs}"
+              done
               exit 1
             fi
             sleep 1
