@@ -114,7 +114,8 @@ class GatewayRouterTest {
         estimate("stripe", 0.98, 300);
         estimate("razorpay", 0.97, 400);
 
-        GatewayRouter router = new GatewayRouter(configs, routingConfig, metrics, circuits, RandomGenerator.getDefault());
+        GatewayRouter router = new GatewayRouter(configs, routingConfig, metrics, circuits,
+                java.util.concurrent.ThreadLocalRandom.current());
         GatewayRouter.Decision card = router.decide(PaymentMethod.CARD, "INR", 100_000);
         assertThat(card.ranked()).extracting(GatewayRouter.Candidate::gateway).containsExactlyInAnyOrder("stripe", "razorpay");
         assertThat(card.excluded()).extracting(GatewayRouter.Exclusion::reason)
@@ -134,7 +135,8 @@ class GatewayRouterTest {
         estimate("a", 0.99, 200);
         estimate("b", 0.97, 260);
         estimate("c", 0.90, 400);
-        GatewayRouter router = new GatewayRouter(configs, routingConfig, metrics, circuits, RandomGenerator.getDefault());
+        GatewayRouter router = new GatewayRouter(configs, routingConfig, metrics, circuits,
+                java.util.concurrent.ThreadLocalRandom.current());
         GatewayRouter.Decision d = router.decide(PaymentMethod.CARD, "INR", 100_000);
         assertThat(d.ranked().get(0).gateway()).isEqualTo("b");
         assertThat(d.note()).contains("DEGRADED").contains("preferring b");

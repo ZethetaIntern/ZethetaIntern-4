@@ -68,7 +68,10 @@ public class GatewayRouter {
     @org.springframework.beans.factory.annotation.Autowired
     public GatewayRouter(GatewayConfigService gatewayConfigs, RoutingConfigService routingConfig,
                          GatewayMetricsService metrics, CircuitBreakerService circuits) {
-        this(gatewayConfigs, routingConfig, metrics, circuits, RandomGenerator.getDefault());
+        // ThreadLocalRandom: thread-safe and present in every runtime image; RandomGenerator.getDefault()
+        // needs the jdk.random module, which slim JRE images (eclipse-temurin:21-jre) do not ship.
+        this(gatewayConfigs, routingConfig, metrics, circuits,
+                () -> java.util.concurrent.ThreadLocalRandom.current().nextLong());
     }
 
     GatewayRouter(GatewayConfigService gatewayConfigs, RoutingConfigService routingConfig,
